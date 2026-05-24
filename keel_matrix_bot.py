@@ -86,10 +86,10 @@ async def login_to_matrix(homeserver: str, username: str, password: str) -> Tupl
                 print(f"[{datetime.now().isoformat()}] [LOGIN] Success! User: {user_id}, Device: {device_id}")
                 return user_id, access_token
             else:
-                print(f"[{datetime.now().isoformat()}] [LOGIN] Failed: {response.status_code} - {response.text}")
+                print(f"[{datetime.now().isoformat()}] [LOGIN] Failed: HTTP {response.status_code}")
                 return None, None
         except Exception as e:
-            print(f"[{datetime.now().isoformat()}] [LOGIN] Error: {type(e).__name__}: {e}")
+            print(f"[{datetime.now().isoformat()}] [LOGIN] Error: {type(e).__name__}")
             return None, None
 
 
@@ -401,7 +401,7 @@ def format_approvals_list(
 
 
 async def fetch_pending_approvals(keel_url: str, username: str = "", password: str = "", timeout: int = 30) -> tuple[list[Approval], dict]:
-    """Fetch pending approvals from Keel API. Returns approvals and full curl-like debug info."""
+    """Fetch pending approvals from Keel API without retaining authenticated response data."""
     url = f"{keel_url.rstrip('/')}/v1/approvals"
     headers = {}
     
@@ -413,49 +413,27 @@ async def fetch_pending_approvals(keel_url: str, username: str = "", password: s
     
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
-            # Log full request details (curl -v style)
-            req_header_lines = [f"> GET {url} HTTP/1.1"]
-            for key, value in headers.items():
-                if key.lower() == "authorization":
-                    req_header_lines.append(f"> {key}: [REDACTED]")
-                else:
-                    req_header_lines.append(f"> {key}: {value}")
-            req_debug = "\n".join(req_header_lines)
-            print(f"[{datetime.now().isoformat()}] --- Request ---\n{req_debug}")
-            
             response = await client.get(url, headers=headers)
-            
-            # Log full response details (curl -v style)
-            resp_header_lines = [f"< HTTP/1.1 {response.status_code} {response.reason_phrase}"]
-            for key, value in response.headers.items():
-                resp_header_lines.append(f"< {key}: {value}")
-            resp_debug = "\n".join(resp_header_lines)
-            print(f"[{datetime.now().isoformat()}] --- Response ---\n{resp_debug}")
-            
-            # Log the full response body
-            response_text = response.text
-            print(f"[{datetime.now().isoformat()}] --- Response Body ---\n{response_text}")
-            
+            print(f"[{datetime.now().isoformat()}] Approval API response: HTTP {response.status_code}")
             response.raise_for_status()
             data = response.json()
             
             if not isinstance(data, list):
                 print(f"[{datetime.now().isoformat()}] Unexpected response format: {type(data)}")
-                return [], {"request": req_debug, "response_headers": resp_debug, "body": response_text, "status": response.status_code}
+                return [], {"status": response.status_code, "error": "unexpected_response_format"}
             
             approvals = parse_approvals(data)
             print(f"[{datetime.now().isoformat()}] Parsed {len(approvals)} approvals")
-            return approvals, {"request": req_debug, "response_headers": resp_debug, "body": response_text, "status": response.status_code}
+            return approvals, {"status": response.status_code}
         except httpx.HTTPStatusError as e:
             print(f"[{datetime.now().isoformat()}] HTTP error fetching approvals: {e.response.status_code}")
-            print(f"[{datetime.now().isoformat()}] Error response body: {e.response.text}")
-            return [], {"status": e.response.status_code, "error": str(e)}
+            return [], {"status": e.response.status_code, "error": "http_error"}
         except httpx.RequestError as e:
-            print(f"[{datetime.now().isoformat()}] Request error fetching approvals: {e}")
-            return [], {"error": str(e)}
-        except json.JSONDecodeError as e:
-            print(f"[{datetime.now().isoformat()}] JSON decode error: {e}")
-            return [], {"error": str(e)}
+            print(f"[{datetime.now().isoformat()}] Request error fetching approvals: {type(e).__name__}")
+            return [], {"error": "request_error"}
+        except json.JSONDecodeError:
+            print(f"[{datetime.now().isoformat()}] JSON decode error fetching approvals")
+            return [], {"error": "invalid_json"}
 
 
 async def send_matrix_message(
@@ -471,8 +449,8 @@ async def send_matrix_message(
     import uuid
     txn_id = uuid.uuid4().hex
     
-    # The txn_id must be in the URL path, not a query parameter
-    url = f"{homeserver.rstrip('/')}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}?access_token={REDACTED}"
+    # Keep authentication in a header so it cannot leak through URLs or exceptions.
+    url = f"{homeserver.rstrip('/')}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}"
 
     def markdown_links_to_html(text: str) -> str:
         """Render Markdown-style links to Matrix formatted HTML."""
@@ -501,19 +479,22 @@ async def send_matrix_message(
                     "format": "org.matrix.custom.html",
                     "formatted_body": formatted_body
                 },
-                headers={"Content-Type": "application/json"}
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                }
             )
             
-            print(f"[{datetime.now().isoformat()}] [DEBUG] Matrix API Response: {response.status_code} - {response.text}")
+            print(f"[{datetime.now().isoformat()}] [DEBUG] Matrix API Response: HTTP {response.status_code}")
             
             if response.status_code in (200, 201):
                 print(f"[{datetime.now().isoformat()}] [DEBUG] Message sent successfully to room {room_id}")
                 return True
             else:
-                print(f"[{datetime.now().isoformat()}] [DEBUG] Failed to send message: {response.status_code} - {response.text}")
+                print(f"[{datetime.now().isoformat()}] [DEBUG] Failed to send message: HTTP {response.status_code}")
                 return False
         except Exception as e:
-            print(f"[{datetime.now().isoformat()}] [DEBUG] Error sending message: {type(e).__name__}: {e}")
+            print(f"[{datetime.now().isoformat()}] [DEBUG] Error sending message: {type(e).__name__}")
             return False
 
 
@@ -553,12 +534,12 @@ async def resolve_matrix_room_reference(
 
             print(
                 f"[{datetime.now().isoformat()}] Failed to join Matrix room alias "
-                f"{room_reference}: {response.status_code} - {response.text}"
+                f"{room_reference}: HTTP {response.status_code}"
             )
         except Exception as e:
             print(
                 f"[{datetime.now().isoformat()}] Exception while joining Matrix room alias "
-                f"{room_reference}: {type(e).__name__}: {e}"
+                f"{room_reference}: {type(e).__name__}"
             )
 
     return room_reference
@@ -1716,7 +1697,7 @@ class KeelMatrixBot:
             async with httpx.AsyncClient(timeout=30) as client:
                 try:
                     response = await client.post(url, headers=headers, json=payload)
-                    print(f"[{datetime.now().isoformat()}] Auto-approve response: {response.status_code} - {response.text}")
+                    print(f"[{datetime.now().isoformat()}] Auto-approve response: HTTP {response.status_code}")
 
                     if response.status_code in (200, 201):
                         delete_payload = {
@@ -1726,7 +1707,7 @@ class KeelMatrixBot:
                             "voter": self.user_id
                         }
                         delete_response = await client.post(url, headers=headers, json=delete_payload)
-                        print(f"[{datetime.now().isoformat()}] Auto-delete response: {delete_response.status_code} - {delete_response.text}")
+                        print(f"[{datetime.now().isoformat()}] Auto-delete response: HTTP {delete_response.status_code}")
 
                         if delete_response.status_code in (200, 201):
                             auto_approved_identifiers.add(approval.identifier)
@@ -1755,7 +1736,6 @@ class KeelMatrixBot:
                             f"\n"
                             f"Identifier: `{approval.identifier}`\n"
                             f"Status: {response.status_code}\n"
-                            f"Response: {response.text}\n"
                             f"\n"
                             f"{SEPARATOR}"
                         )
@@ -1764,7 +1744,7 @@ class KeelMatrixBot:
                         f"❌ **Auto-approve request error**\n"
                         f"\n"
                         f"Identifier: `{approval.identifier}`\n"
-                        f"Error: {str(e)}\n"
+                        f"Error: {type(e).__name__}\n"
                         f"\n"
                         f"{SEPARATOR}"
                     )
@@ -1811,7 +1791,7 @@ class KeelMatrixBot:
         delete_response = await client.post(url, headers=headers, json=delete_payload)
         print(
             f"[{datetime.now().isoformat()}] Stale delete response: "
-            f"{delete_response.status_code} - {delete_response.text}"
+            f"HTTP {delete_response.status_code}"
         )
 
         if delete_response.status_code in (200, 201):
@@ -1820,7 +1800,7 @@ class KeelMatrixBot:
         return (
             False,
             resolved_approval_id,
-            f"delete failed with status {delete_response.status_code}: {delete_response.text}"
+            f"delete failed with status {delete_response.status_code}"
         )
     
     async def handle_approve_reject(self, room_id: str, identifier: str, action: str):
@@ -1864,7 +1844,7 @@ class KeelMatrixBot:
         async with httpx.AsyncClient(timeout=30) as client:
             try:
                 response = await client.post(url, headers=headers, json=payload)
-                print(f"[{datetime.now().isoformat()}] {action.capitalize()} response: {response.status_code} - {response.text}")
+                print(f"[{datetime.now().isoformat()}] {action.capitalize()} response: HTTP {response.status_code}")
                 
                 if response.status_code in (200, 201):
                     # Success - fetch approval ID and delete it
@@ -1887,7 +1867,7 @@ class KeelMatrixBot:
                             "voter": self.user_id
                         }
                         delete_response = await client.post(url, headers=headers, json=delete_payload)
-                        print(f"[{datetime.now().isoformat()}] Delete response: {delete_response.status_code} - {delete_response.text}")
+                        print(f"[{datetime.now().isoformat()}] Delete response: HTTP {delete_response.status_code}")
                         
                         if delete_response.status_code in (200, 201):
                             response_msg = (
@@ -1948,7 +1928,6 @@ class KeelMatrixBot:
                         f"\n"
                         f"Identifier: `{identifier}`\n"
                         f"Status: {response.status_code}\n"
-                        f"Response: {response.text}\n"
                         f"\n"
                         f"{SEPARATOR}"
                     )
@@ -1957,7 +1936,7 @@ class KeelMatrixBot:
                     f"❌ **Request error**\n"
                     f"\n"
                     f"Identifier: `{identifier}`\n"
-                    f"Error: {str(e)}\n"
+                    f"Error: {type(e).__name__}\n"
                     f"\n"
                     f"{SEPARATOR}"
                 )
@@ -2117,7 +2096,7 @@ class KeelMatrixBot:
         async with httpx.AsyncClient(timeout=30) as client:
             try:
                 response = await client.post(url, headers=headers, json=payload)
-                print(f"[{datetime.now().isoformat()}] {action.capitalize()} response: {response.status_code} - {response.text}")
+                print(f"[{datetime.now().isoformat()}] {action.capitalize()} response: HTTP {response.status_code}")
                 
                 if response.status_code in (200, 201):
                     # Success - now delete the approval
@@ -2129,7 +2108,7 @@ class KeelMatrixBot:
                             "voter": self.user_id
                         }
                         delete_response = await client.post(url, headers=headers, json=delete_payload)
-                        print(f"[{datetime.now().isoformat()}] Delete response: {delete_response.status_code} - {delete_response.text}")
+                        print(f"[{datetime.now().isoformat()}] Delete response: HTTP {delete_response.status_code}")
                         
                         if delete_response.status_code in (200, 201):
                             response_msg = (
@@ -2191,7 +2170,6 @@ class KeelMatrixBot:
                         f"\n"
                         f"Identifier: `{identifier}`\n"
                         f"Status: {response.status_code}\n"
-                        f"Response: {response.text}\n"
                         f"\n"
                         f"{SEPARATOR}"
                     )
@@ -2200,7 +2178,7 @@ class KeelMatrixBot:
                     f"❌ **Request error**\n"
                     f"\n"
                     f"Identifier: `{identifier}`\n"
-                    f"Error: {str(e)}\n"
+                    f"Error: {type(e).__name__}\n"
                     f"\n"
                     f"{SEPARATOR}"
                 )
