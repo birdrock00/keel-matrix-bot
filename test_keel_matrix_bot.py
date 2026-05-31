@@ -49,7 +49,7 @@ class ApprovalActionMessageTests(unittest.TestCase):
             message,
         )
         self.assertIn(
-            "[Deny app](https://bot.example/deny?identifier=namespace%2Fdeployment%2Fapp%3A1.2.3)",
+            "[Deny approval app](https://bot.example/deny?identifier=namespace%2Fdeployment%2Fapp%3A1.2.3)",
             message,
         )
         self.assertIn("`approve namespace/deployment/app:1.2.3`", message)
@@ -59,7 +59,7 @@ class ApprovalActionMessageTests(unittest.TestCase):
         message = format_approvals_list([sample_approval()], approve_base_url="https://bot.example")
 
         self.assertIn("[Approve app](https://bot.example/approve?identifier=namespace%2Fdeployment%2Fapp%3A1.2.3)", message)
-        self.assertIn("[Deny app](https://bot.example/deny?identifier=namespace%2Fdeployment%2Fapp%3A1.2.3)", message)
+        self.assertIn("[Deny approval app](https://bot.example/deny?identifier=namespace%2Fdeployment%2Fapp%3A1.2.3)", message)
 
     def test_deny_action_url_uses_public_deny_route_and_encoded_identifier(self):
         self.assertEqual(
@@ -74,9 +74,9 @@ class ApprovalActionMessageTests(unittest.TestCase):
     def test_deny_page_posts_to_deny_api(self):
         page = render_async_approval_action_page("ns/app:1", "deny")
 
-        self.assertIn("<title>Deny Update</title>", page)
+        self.assertIn("<title>Deny approval Update</title>", page)
         self.assertIn('/api/deny?identifier=ns%2Fapp%3A1', page)
-        self.assertIn("Submitting deny", page)
+        self.assertIn("Submitting deny approval", page)
 
     def test_approval_action_gerunds_are_spelled_correctly(self):
         self.assertEqual(get_action_gerund("approve"), "Approving")
@@ -104,7 +104,7 @@ class HttpApprovalActionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status_code, 200)
         self.assertEqual(calls, [("!room:example", "ns/app:1", "reject")])
-        self.assertIn("Deny request submitted", message)
+        self.assertIn("Deny approval request submitted", message)
 
 
 if __name__ == "__main__":
