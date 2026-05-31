@@ -120,8 +120,8 @@ def get_action_label(action: str) -> str:
     """Return the user-facing label for an approval action."""
     return {
         "approve": "Approve",
-        "reject": "Deny",
-        "deny": "Deny",
+        "reject": "Deny approval",
+        "deny": "Deny approval",
     }.get(action.lower(), action.capitalize())
 
 
@@ -132,6 +132,12 @@ def get_action_gerund(action: str) -> str:
         "reject": "Rejecting",
         "deny": "Denying",
     }.get(action.lower(), f"{action.capitalize()}ing")
+
+
+def get_action_noun(action: str) -> str:
+    """Return the approval action as a readable noun phrase."""
+    normalized = normalize_approval_action(action)
+    return "approval" if normalized == "approve" else "deny approval"
 
 
 def normalize_approval_action(action: str) -> str:
@@ -184,7 +190,7 @@ def format_approval_message(
 
     lines.extend([
         "",
-        f"[Approve {image_name}]({approve_url}) | [Deny {image_name}]({deny_url})",
+        f"[Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})",
         f"Reply with `approve {approval.identifier}` or `reject {approval.identifier}` to take action.",
         "",
         "─" * 40
@@ -222,7 +228,7 @@ def render_async_approval_action_page(identifier: str, action: str) -> str:
     normalized_action = normalize_approval_action(action)
     path = "approve" if normalized_action == "approve" else "deny"
     label = get_action_label(normalized_action)
-    label_lower = label.lower()
+    action_noun = get_action_noun(normalized_action)
     api_path = f"/api/{path}?identifier={encoded_identifier}"
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -266,7 +272,7 @@ def render_async_approval_action_page(identifier: str, action: str) -> str:
 </head>
 <body>
   <main>
-    <h1>Submitting {label_lower}</h1>
+    <h1>Submitting {action_noun}</h1>
     <p>Approval target: <code>{safe_identifier}</code></p>
     <div id="status" class="pending">Sending request...</div>
   </main>
@@ -441,7 +447,7 @@ def format_approvals_list(
         approve_url = get_approve_action_url(approval.identifier, approve_base_url)
         deny_url = get_deny_action_url(approval.identifier, approve_base_url)
         image_name = get_image_name_from_identifier(approval.identifier)
-        lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny {image_name}]({deny_url})")
+        lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})")
         
         if days_pending:
             lines.append(f"   {days_pending}")
