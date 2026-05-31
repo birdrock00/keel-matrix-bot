@@ -116,7 +116,34 @@ def parse_approvals(data: list) -> list[Approval]:
     return approvals
 
 
-def format_approval_message(approval: Approval) -> str:
+def get_action_label(action: str) -> str:
+    """Return the user-facing label for an approval action."""
+    return {
+        "approve": "Approve",
+        "reject": "Deny",
+        "deny": "Deny",
+    }.get(action.lower(), action.capitalize())
+
+
+def get_action_gerund(action: str) -> str:
+    """Return the correctly spelled gerund for an approval action."""
+    return {
+        "approve": "Approving",
+        "reject": "Rejecting",
+        "deny": "Denying",
+    }.get(action.lower(), f"{action.capitalize()}ing")
+
+
+def normalize_approval_action(action: str) -> str:
+    """Normalize UI approval actions to the values expected by Keel."""
+    normalized = action.lower().strip()
+    return "reject" if normalized == "deny" else normalized
+
+
+def format_approval_message(
+    approval: Approval,
+    approve_base_url: str = DEFAULT_APPROVE_BASE_URL,
+) -> str:
     """Format an approval as a readable Matrix message."""
     # Get release notes URL for this identifier (returns N/A if not set)
     release_notes_url = get_release_notes_url(approval)
@@ -151,9 +178,14 @@ def format_approval_message(approval: Approval) -> str:
     # Add Release Notes URL
     lines.append(f"📝 Release Notes URL ({release_notes_key}): {release_notes_url}")
     
+    approve_url = get_approval_action_url(approval.identifier, "approve", approve_base_url)
+    deny_url = get_approval_action_url(approval.identifier, "deny", approve_base_url)
+    image_name = get_image_name_from_identifier(approval.identifier)
+
     lines.extend([
         "",
-        "Reply with `approve {identifier}` or `reject {identifier}` to take action.",
+        f"[Approve {image_name}]({approve_url}) | [Deny {image_name}]({deny_url})",
+        f"Reply with `approve {approval.identifier}` or `reject {approval.identifier}` to take action.",
         "",
         "─" * 40
     ])
@@ -161,23 +193,43 @@ def format_approval_message(approval: Approval) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def get_approval_action_url(
+    identifier: str,
+    action: str,
+    base_url: str = DEFAULT_APPROVE_BASE_URL,
+) -> str:
+    """Build the clickable approval action URL for a given approval identifier."""
+    encoded_identifier = quote(identifier, safe="")
+    normalized_action = normalize_approval_action(action)
+    path = "approve" if normalized_action == "approve" else "deny"
+    return f"{base_url.rstrip('/')}/{path}?identifier={encoded_identifier}"
+
+
 def get_approve_action_url(identifier: str, base_url: str = DEFAULT_APPROVE_BASE_URL) -> str:
     """Build the clickable approval URL for a given approval identifier."""
-    encoded_identifier = quote(identifier, safe="")
-    return f"{base_url.rstrip('/')}/approve?identifier={encoded_identifier}"
+    return get_approval_action_url(identifier, "approve", base_url)
 
 
-def render_async_approve_page(identifier: str) -> str:
+def get_deny_action_url(identifier: str, base_url: str = DEFAULT_APPROVE_BASE_URL) -> str:
+    """Build the clickable denial URL for a given approval identifier."""
+    return get_approval_action_url(identifier, "deny", base_url)
+
+
+def render_async_approval_action_page(identifier: str, action: str) -> str:
     """Render a page that asynchronously calls the approval API without redirecting."""
     encoded_identifier = quote(identifier, safe="")
     safe_identifier = html.escape(identifier)
-    api_path = f"/api/approve?identifier={encoded_identifier}"
+    normalized_action = normalize_approval_action(action)
+    path = "approve" if normalized_action == "approve" else "deny"
+    label = get_action_label(normalized_action)
+    label_lower = label.lower()
+    api_path = f"/api/{path}?identifier={encoded_identifier}"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Approve Update</title>
+  <title>{label} Update</title>
   <style>
     body {{
       font-family: sans-serif;
@@ -214,30 +266,35 @@ def render_async_approve_page(identifier: str) -> str:
 </head>
 <body>
   <main>
-    <h1>Submitting approval</h1>
+    <h1>Submitting {label_lower}</h1>
     <p>Approval target: <code>{safe_identifier}</code></p>
     <div id="status" class="pending">Sending request...</div>
   </main>
   <script>
     const statusEl = document.getElementById("status");
-    async function submitApproval() {{
+    async function submitApprovalAction() {{
       try {{
         const response = await fetch("{api_path}", {{
           method: "POST",
           headers: {{ "Accept": "application/json" }}
         }});
         const payload = await response.json();
-        statusEl.textContent = payload.message || "Approval request completed.";
+        statusEl.textContent = payload.message || "{label} request completed.";
         statusEl.className = response.ok ? "success" : "error";
       }} catch (error) {{
-        statusEl.textContent = "Approval request failed: " + error;
+        statusEl.textContent = "{label} request failed: " + error;
         statusEl.className = "error";
       }}
     }}
-    void submitApproval();
+    void submitApprovalAction();
   </script>
 </body>
 </html>"""
+
+
+def render_async_approve_page(identifier: str) -> str:
+    """Render a page that asynchronously calls the approval API without redirecting."""
+    return render_async_approval_action_page(identifier, "approve")
 
 
 def get_image_name_from_identifier(identifier: str) -> str:
@@ -382,8 +439,9 @@ def format_approvals_list(
             lines.append(f"   Image: `{effective_image}`")
 
         approve_url = get_approve_action_url(approval.identifier, approve_base_url)
+        deny_url = get_deny_action_url(approval.identifier, approve_base_url)
         image_name = get_image_name_from_identifier(approval.identifier)
-        lines.append(f"   [Approve {image_name}]({approve_url})")
+        lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny {image_name}]({deny_url})")
         
         if days_pending:
             lines.append(f"   {days_pending}")
@@ -1091,22 +1149,39 @@ class KeelMatrixBot:
             f"{self.http_host}:{self.http_port} (public base URL: {self.public_base_url})"
         )
 
-    async def process_http_approve_request(self, identifier: str) -> tuple[int, str]:
-        """Process an HTTP approval request and return (status_code, message)."""
+    async def process_http_approval_action_request(self, identifier: str, action: str) -> tuple[int, str]:
+        """Process an HTTP approval action request and return (status_code, message)."""
         clean_identifier = identifier.strip()
         if not clean_identifier:
             return 400, "Missing identifier query parameter."
 
-        # Reuse existing approval flow so behavior stays consistent with Matrix commands.
-        await self.handle_approve_reject(self.room_id, clean_identifier, "approve")
-        return 200, f"Approval request submitted for '{clean_identifier}'."
+        normalized_action = normalize_approval_action(action)
+        if normalized_action not in {"approve", "reject"}:
+            return 400, "Unsupported approval action."
 
-    def build_http_approve_page(self, identifier: str) -> tuple[int, str, str]:
-        """Return the HTML page that triggers async approval submission."""
+        # Reuse existing approval flow so behavior stays consistent with Matrix commands.
+        await self.handle_approve_reject(self.room_id, clean_identifier, normalized_action)
+        return 200, f"{get_action_label(normalized_action)} request submitted for '{clean_identifier}'."
+
+    async def process_http_approve_request(self, identifier: str) -> tuple[int, str]:
+        """Process an HTTP approval request and return (status_code, message)."""
+        return await self.process_http_approval_action_request(identifier, "approve")
+
+    def build_http_approval_action_page(self, identifier: str, action: str) -> tuple[int, str, str]:
+        """Return the HTML page that triggers async approval action submission."""
         clean_identifier = identifier.strip()
         if not clean_identifier:
             return 400, "Missing identifier query parameter.", "text/plain"
-        return 200, render_async_approve_page(clean_identifier), "text/html"
+
+        normalized_action = normalize_approval_action(action)
+        if normalized_action not in {"approve", "reject"}:
+            return 400, "Unsupported approval action.", "text/plain"
+
+        return 200, render_async_approval_action_page(clean_identifier, normalized_action), "text/html"
+
+    def build_http_approve_page(self, identifier: str) -> tuple[int, str, str]:
+        """Return the HTML page that triggers async approval submission."""
+        return self.build_http_approval_action_page(identifier, "approve")
 
     async def _write_http_response(self, writer, status_code: int, body: str, content_type: str):
         """Write a minimal HTTP/1.1 response to the socket."""
@@ -1154,7 +1229,7 @@ class KeelMatrixBot:
 
             method = method.upper()
             if method not in {"GET", "POST"}:
-                await self._write_http_response(writer, 405, "Only GET is supported.", "text/plain")
+                await self._write_http_response(writer, 405, "Only GET and POST are supported.", "text/plain")
                 writer.close()
                 await writer.wait_closed()
                 return
@@ -1168,12 +1243,23 @@ class KeelMatrixBot:
             elif path == "/approve" and method == "GET":
                 identifier = query.get("identifier", [""])[0]
                 identifier = unquote(identifier)
-                status_code, body, content_type = self.build_http_approve_page(identifier)
+                status_code, body, content_type = self.build_http_approval_action_page(identifier, "approve")
+                await self._write_http_response(writer, status_code, body, content_type)
+            elif path in {"/deny", "/reject"} and method == "GET":
+                identifier = query.get("identifier", [""])[0]
+                identifier = unquote(identifier)
+                status_code, body, content_type = self.build_http_approval_action_page(identifier, "reject")
                 await self._write_http_response(writer, status_code, body, content_type)
             elif path == "/api/approve" and method == "POST":
                 identifier = query.get("identifier", [""])[0]
                 identifier = unquote(identifier)
-                status_code, message = await self.process_http_approve_request(identifier)
+                status_code, message = await self.process_http_approval_action_request(identifier, "approve")
+                body = json.dumps({"message": message})
+                await self._write_http_response(writer, status_code, body, "application/json")
+            elif path in {"/api/deny", "/api/reject"} and method == "POST":
+                identifier = query.get("identifier", [""])[0]
+                identifier = unquote(identifier)
+                status_code, message = await self.process_http_approval_action_request(identifier, "reject")
                 body = json.dumps({"message": message})
                 await self._write_http_response(writer, status_code, body, "application/json")
             else:
@@ -1820,7 +1906,7 @@ class KeelMatrixBot:
             )
             return
         
-        sending_msg = f"🔄 {action.capitalize()}ing `{identifier}`..."
+        sending_msg = f"🔄 {get_action_gerund(action)} `{identifier}`..."
         await send_matrix_message(
             self.homeserver, self.user_id, self.access_token,
             room_id, sending_msg
@@ -1924,7 +2010,7 @@ class KeelMatrixBot:
                     remove_from_memory(identifier)
                 else:
                     response_msg = (
-                        f"❌ **Error {action.capitalize()}ing approval**\n"
+                        f"❌ **Error {get_action_gerund(action)} approval**\n"
                         f"\n"
                         f"Identifier: `{identifier}`\n"
                         f"Status: {response.status_code}\n"
@@ -2166,7 +2252,7 @@ class KeelMatrixBot:
                     remove_from_memory(identifier)
                 else:
                     response_msg = (
-                        f"❌ **Error {action.capitalize()}ing approval**\n"
+                        f"❌ **Error {get_action_gerund(action)} approval**\n"
                         f"\n"
                         f"Identifier: `{identifier}`\n"
                         f"Status: {response.status_code}\n"
