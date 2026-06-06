@@ -1,0 +1,62 @@
+name: Publish Docker Image
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set release date tag
+        id: release-date
+        run: echo "tag=$(date -u +'%m-%d-%Y')" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/birdrock00/keel-matrix-bot
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.release-date.outputs.tag }},enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
+      - name: Build and publish
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Create release for daily image
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: image-${{ steps.release-date.outputs.tag }}-${{ github.run_id }}
+          name: Container image ${{ steps.release-date.outputs.tag }}
+          body: |
+            Container image for ${{ steps.release-date.outputs.tag }}:
+
+            `ghcr.io/birdrock00/keel-matrix-bot:${{ steps.release-date.outputs.tag }}`
+          make_latest: true
