@@ -138,6 +138,21 @@ class ApprovalMemoryPostgresAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["notified_approvals"], ["approval-1"])
         self.assertEqual(data["release_notes_urls"]["app"], "https://example.com")
 
+    async def test_load_all_from_db_decodes_asyncpg_jsonb_strings(self):
+        memory = ApprovalMemory()
+
+        class Pool:
+            async def fetch(self, sql):
+                return [
+                    {"key": "approval_identifiers", "value": '{"approval-1": "deployment/app/app:latest"}'},
+                    {"key": "auto_approve_targets", "value": '["app"]'},
+                ]
+
+        data = await memory._load_all_from_db(Pool())
+
+        self.assertEqual(data["approval_identifiers"], {"approval-1": "deployment/app/app:latest"})
+        self.assertEqual(data["auto_approve_targets"], ["app"])
+
     async def test_save_all_to_db_upserts_json_values(self):
         memory = ApprovalMemory()
         pool = FakePool()
@@ -151,6 +166,7 @@ class ApprovalMemoryPostgresAsyncTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(pool.executed), 2)
+        self.assertIn("$2::jsonb", pool.executed[0][0])
         self.assertEqual(pool.executed[0][1][0], "notified_approvals")
         self.assertEqual(pool.executed[0][1][1], '["approval-1"]')
         self.assertEqual(pool.executed[1][1][0], "release_notes_urls")

@@ -862,7 +862,10 @@ class ApprovalMemory:
         rows = await pool.fetch("SELECT key, value FROM keel_bot_state")
         result = {}
         for row in rows:
-            result[row['key']] = row['value']
+            value = row['value']
+            if isinstance(value, str):
+                value = json.loads(value)
+            result[row['key']] = value
         return result
 
     async def _save_all_to_db(self, pool, data: dict):
@@ -870,8 +873,8 @@ class ApprovalMemory:
         values = list(data.items())
         for key, value in values:
             await pool.execute(
-                "INSERT INTO keel_bot_state (key, value) VALUES ($1, $2) "
-                "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
+                "INSERT INTO keel_bot_state (key, value) VALUES ($1, $2::jsonb) "
+                "ON CONFLICT (key) DO UPDATE SET value = $2::jsonb, updated_at = now()",
                 key, json.dumps(value)
             )
 
