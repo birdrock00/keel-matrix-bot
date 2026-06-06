@@ -816,11 +816,36 @@ class ApprovalMemory:
             await pool.close()
 
     def _run_db_with_pool(self, operation):
-        loop = asyncio.new_event_loop()
+        """Run a database operation from sync code.
+
+        Most bot state helpers are synchronous, but they are also called from
+        async Matrix and HTTP handlers. Python cannot run a nested event loop in
+        that same thread, so use a short-lived worker thread when the caller is
+        already inside an event loop.
+        """
+        async def run_operation():
+            return await self._with_db_pool(operation)
+
         try:
-            return loop.run_until_complete(self._with_db_pool(operation))
-        finally:
-            loop.close()
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(run_operation())
+
+        result = {}
+
+        def run_in_thread():
+            try:
+                result["value"] = asyncio.run(run_operation())
+            except Exception as e:
+                result["error"] = e
+
+        thread = threading.Thread(target=run_in_thread, daemon=True)
+        thread.start()
+        thread.join()
+
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
 
     async def _ensure_schema(self, pool):
         """Create the state table if it doesn't exist."""
