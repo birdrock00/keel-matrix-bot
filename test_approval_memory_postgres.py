@@ -12,6 +12,7 @@ sys.modules.setdefault("httpx", httpx_stub)
 nio_stub = types.ModuleType("nio")
 nio_stub.AsyncClient = object
 nio_stub.RoomMessageText = object
+nio_stub.ReactionEvent = object
 sys.modules.setdefault("nio", nio_stub)
 
 from keel_matrix_bot import ApprovalMemory
@@ -120,6 +121,52 @@ class ApprovalMemoryPostgresTests(unittest.TestCase):
         memory.refresh_from_approvals([live])
         self.assertNotIn("legacy-uuid-1234", memory.notified_approvals)
 
+    def test_apply_state_restores_reaction_targets(self):
+        memory = ApprovalMemory()
+        memory._apply_state(
+            {"reaction_targets": {"$evt:1": "deployment/app/app:latest"}}
+        )
+        self.assertEqual(memory.reaction_targets["$evt:1"], "deployment/app/app:latest")
+
+    def test_reaction_target_mapping_is_persisted(self):
+        memory = ApprovalMemory()
+        memory._loaded = True
+        saved = {}
+        memory._save_state = lambda: saved.update(
+            {"reaction_targets": dict(memory.reaction_targets)}
+        )
+
+        memory.record_reaction_target("$evt:1", "deployment/app/app:latest")
+
+        # Mapping is in the persisted snapshot, so it survives a pod restart.
+        self.assertEqual(saved["reaction_targets"]["$evt:1"], "deployment/app/app:latest")
+        self.assertEqual(memory.get_reaction_target("$evt:1"), "deployment/app/app:latest")
+
+    def test_save_state_includes_reaction_targets(self):
+        memory = ApprovalMemory()
+        memory._loaded = True
+        memory.reaction_targets = {"$evt:1": "deployment/app/app:latest"}
+        captured = {}
+        memory._run_db_with_pool = lambda op: None
+        # Intercept the dict that _save_state builds by monkeypatching _save_all_to_db
+        original = memory._save_all_to_db
+
+        async def capture(pool, data):
+            captured.update(data)
+
+        memory._save_all_to_db = capture
+        # _save_state passes a lambda to _run_db_with_pool; run it directly here.
+        import asyncio as _asyncio
+
+        def run(op):
+            _asyncio.run(op(None))
+
+        memory._run_db_with_pool = run
+        memory._save_state()
+
+        self.assertIn("reaction_targets", captured)
+        self.assertEqual(captured["reaction_targets"]["$evt:1"], "deployment/app/app:latest")
+
     def test_reset_state_clears_all_persistent_fields(self):
         memory = ApprovalMemory()
         memory.notified_approvals = {"approval-1"}
@@ -128,6 +175,7 @@ class ApprovalMemoryPostgresTests(unittest.TestCase):
         memory.release_notes_urls = {"app": "https://example.com"}
         memory.auto_approve_targets = {"app"}
         memory.auto_approve_failures = {"approval-1": {"reason": "error"}}
+        memory.reaction_targets = {"$evt:1": "deployment/app/app:latest"}
 
         memory._reset_state()
 
@@ -137,6 +185,7 @@ class ApprovalMemoryPostgresTests(unittest.TestCase):
         self.assertEqual(memory.release_notes_urls, {})
         self.assertEqual(memory.auto_approve_targets, set())
         self.assertEqual(memory.auto_approve_failures, {})
+        self.assertEqual(memory.reaction_targets, {})
 
 
 class ApprovalMemoryPostgresAsyncTests(unittest.IsolatedAsyncioTestCase):
