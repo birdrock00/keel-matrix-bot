@@ -16,7 +16,10 @@ sys.modules.setdefault("nio", nio_stub)
 import keel_matrix_bot
 from keel_matrix_bot import (
     Approval,
+    ApprovalMemory,
     KeelMatrixBot,
+    approval_dedup_key,
+    approval_notification_txn_id,
     format_approval_message,
     format_approvals_list,
     get_action_gerund,
@@ -26,18 +29,99 @@ from keel_matrix_bot import (
 )
 
 
-def sample_approval(identifier="namespace/deployment/app:1.2.3"):
+def sample_approval(
+    identifier="namespace/deployment/app:1.2.3",
+    approval_id="approval-1",
+    current_version="1.2.2",
+    new_version="1.2.3",
+    repository_digest="",
+):
     return Approval(
-        id="approval-1",
+        id=approval_id,
         provider="kubernetes",
         identifier=identifier,
         message="New image available",
-        current_version="1.2.2",
-        new_version="1.2.3",
+        current_version=current_version,
+        new_version=new_version,
         created_at="2026-05-31T12:34:56Z",
         repository_name="docker.io/example/app",
         repository_tag="1.2.3",
+        repository_digest=repository_digest,
     )
+
+
+def loaded_memory():
+    """Return an ApprovalMemory that skips PostgreSQL load/save for unit tests."""
+    memory = ApprovalMemory()
+    memory._loaded = True
+    memory._save_state = lambda: None
+    return memory
+
+
+class ApprovalDedupKeyTests(unittest.TestCase):
+    def test_dedup_key_is_independent_of_volatile_keel_id(self):
+        a1 = sample_approval(approval_id="uuid-aaa")
+        a2 = sample_approval(approval_id="uuid-bbb")  # Keel re-minted the id
+        self.assertEqual(approval_dedup_key(a1), approval_dedup_key(a2))
+
+    def test_dedup_key_changes_with_version_transition(self):
+        a1 = sample_approval(current_version="1.2.2", new_version="1.2.3")
+        a2 = sample_approval(current_version="1.2.3", new_version="1.2.4")
+        self.assertNotEqual(approval_dedup_key(a1), approval_dedup_key(a2))
+
+    def test_dedup_key_includes_digest_when_present(self):
+        a1 = sample_approval(repository_digest="sha256:aaa")
+        a2 = sample_approval(repository_digest="sha256:bbb")
+        self.assertNotEqual(approval_dedup_key(a1), approval_dedup_key(a2))
+        self.assertIn("sha256:aaa", approval_dedup_key(a1))
+
+    def test_rotated_keel_id_is_not_renotified(self):
+        memory = loaded_memory()
+        first = sample_approval(approval_id="uuid-aaa")
+        # First poll: brand-new logical update, should be notified.
+        self.assertEqual([a.id for a in memory.get_new_approvals([first])], ["uuid-aaa"])
+        memory.mark_as_notified([first])
+
+        # Keel rotates the UUID for the SAME logical update.
+        rotated = sample_approval(approval_id="uuid-bbb")
+        self.assertTrue(memory.is_approved(rotated))
+        self.assertEqual(memory.get_new_approvals([rotated]), [])
+
+    def test_refresh_does_not_evict_logical_approval_when_id_rotates(self):
+        memory = loaded_memory()
+        first = sample_approval(approval_id="uuid-aaa")
+        memory.mark_as_notified([first])
+
+        # Reconcile against the same logical approval with a rotated id.
+        rotated = sample_approval(approval_id="uuid-bbb")
+        memory.refresh_from_approvals([rotated])
+
+        # Still considered notified -> no duplicate notification.
+        self.assertTrue(memory.is_approved(rotated))
+        self.assertIn(approval_dedup_key(rotated), memory.notified_approvals)
+
+    def test_refresh_evicts_genuinely_absent_approvals(self):
+        memory = loaded_memory()
+        gone = sample_approval(identifier="ns/old:1", current_version="1", new_version="2")
+        memory.mark_as_notified([gone])
+        memory.refresh_from_approvals([])  # nothing pending anymore
+        self.assertEqual(memory.notified_approvals, set())
+
+    def test_notification_txn_id_is_deterministic_and_order_independent(self):
+        a = sample_approval(identifier="ns/a:1")
+        b = sample_approval(identifier="ns/b:1")
+        self.assertEqual(
+            approval_notification_txn_id([a, b]),
+            approval_notification_txn_id([b, a]),
+        )
+        self.assertEqual(
+            approval_notification_txn_id(a),
+            approval_notification_txn_id([a]),
+        )
+        self.assertNotEqual(
+            approval_notification_txn_id([a]),
+            approval_notification_txn_id([b]),
+        )
 
 
 class ApprovalActionMessageTests(unittest.TestCase):

@@ -133,6 +133,42 @@ def parse_approvals(data: list) -> list[Approval]:
     return approvals
 
 
+def approval_dedup_key(approval: Approval) -> str:
+    """Return a stable dedup key for an approval.
+
+    Keel mints a brand-new UUID ``id`` every time it re-creates an approval
+    record for the same logical image update, so the ``id`` is useless for
+    deduplication. The ``identifier`` plus the version transition (and the
+    target image digest, when known) stays constant for a given logical update,
+    so it is the correct key for tracking what we have already notified about.
+
+    Including ``repository_digest`` means a genuinely new image (same tag, new
+    digest, e.g. ``:latest`` re-pushed) still alerts exactly once.
+    """
+    key = f"{approval.identifier}|{approval.current_version}->{approval.new_version}"
+    if approval.repository_digest:
+        key = f"{key}|{approval.repository_digest}"
+    return key
+
+
+def approval_notification_txn_id(approvals) -> str:
+    """Return a deterministic Matrix transaction id for an approval notification.
+
+    Accepts a single Approval or a list of approvals (a notification message may
+    batch several). Derived from the stable dedup key(s) (hashed so it is
+    URL-safe and short) so an accidental re-send of the same logical
+    notification is collapsed by the Matrix homeserver instead of rendering as
+    two messages.
+    """
+    import hashlib
+    if isinstance(approvals, Approval):
+        approvals = [approvals]
+    # Sort so the txn id is independent of approval ordering within the batch.
+    combined = "\n".join(sorted(approval_dedup_key(a) for a in approvals))
+    digest = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+    return f"keel-approval-{digest[:32]}"
+
+
 def get_action_label(action: str) -> str:
     """Return the user-facing label for an approval action."""
     return {
@@ -644,13 +680,20 @@ async def send_matrix_message(
     user_id: str,
     access_token: str,
     room_id: str,
-    message: str
+    message: str,
+    txn_id: Optional[str] = None
 ) -> bool:
-    """Send a message to a Matrix room using the Matrix REST API directly."""
+    """Send a message to a Matrix room using the Matrix REST API directly.
+
+    When ``txn_id`` is provided it is used as the Matrix transaction id so the
+    homeserver collapses accidental re-sends (idempotency). When omitted a fresh
+    random transaction id is generated, preserving the previous behavior.
+    """
     print(f"[{datetime.now().isoformat()}] [DEBUG] Connecting to Matrix homeserver: {homeserver}")
 
     import uuid
-    txn_id = uuid.uuid4().hex
+    if txn_id is None:
+        txn_id = uuid.uuid4().hex
 
     # Keep authentication in a header so it cannot leak through URLs or exceptions.
     url = f"{homeserver.rstrip('/')}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}"
@@ -739,13 +782,14 @@ class ApprovalMemory:
     Persistent memory for tracking approval notifications.
     Saves state to PostgreSQL so it survives bot restarts.
 
-    Tracks:
-    - notified_approvals: Set of Keel approval IDs that have been notified
-    - approval_timestamps: Map of approval ID to when it was first seen
-    - approval_identifiers: Map of approval ID to approval identifier
+    Tracks (keyed by the stable approval_dedup_key, NOT Keel's volatile UUID id,
+    because Keel re-mints a new id for the same logical image update):
+    - notified_approvals: Set of stable dedup keys that have been notified
+    - approval_timestamps: Map of dedup key to when it was first seen
+    - approval_identifiers: Map of dedup key to approval identifier
     - release_notes_urls: Map of approval identifier to release notes URL
     - auto_approve_targets: Set of keywords to auto-approve when seen in pending approvals
-    - auto_approve_failures: Map of approval ID to the first failed auto-approve attempt
+    - auto_approve_failures: Map of dedup key to the first failed auto-approve attempt
     """
 
     def __init__(self):
@@ -753,11 +797,11 @@ class ApprovalMemory:
         self._db_config: Optional[dict] = None
         self._loaded = False
         self.notified_approvals: set = set()
-        self.approval_timestamps: dict = {}  # approval_id -> first_seen_timestamp
-        self.approval_identifiers: dict = {}  # approval_id -> identifier
+        self.approval_timestamps: dict = {}  # dedup_key -> first_seen_timestamp
+        self.approval_identifiers: dict = {}  # dedup_key -> identifier
         self.release_notes_urls: dict = {}  # identifier -> release_notes_url
         self.auto_approve_targets: set = set()  # keywords/identifiers to auto-approve
-        self.auto_approve_failures: dict = {}  # approval_id -> failure details
+        self.auto_approve_failures: dict = {}  # dedup_key -> failure details
 
     def _database_config_from_env(self) -> Optional[dict]:
         """Return PostgreSQL settings only when explicitly configured."""
@@ -928,7 +972,7 @@ class ApprovalMemory:
     def is_approved(self, approval: Approval) -> bool:
         """Check if an approval has already been notified."""
         self._ensure_loaded()
-        return approval.id in self.notified_approvals
+        return approval_dedup_key(approval) in self.notified_approvals
 
     def get_new_approvals(self, approvals: list[Approval]) -> list[Approval]:
         """Return only approvals that haven't been notified yet."""
@@ -937,10 +981,11 @@ class ApprovalMemory:
             new_approvals = []
             now = datetime.now().isoformat()
             for approval in approvals:
-                self.approval_identifiers[approval.id] = approval.identifier
-                if approval.id not in self.approval_timestamps:
-                    self.approval_timestamps[approval.id] = now
-                if approval.id not in self.notified_approvals:
+                key = approval_dedup_key(approval)
+                self.approval_identifiers[key] = approval.identifier
+                if key not in self.approval_timestamps:
+                    self.approval_timestamps[key] = now
+                if key not in self.notified_approvals:
                     new_approvals.append(approval)
             return new_approvals
 
@@ -949,10 +994,11 @@ class ApprovalMemory:
         self._ensure_loaded()
         with self._lock:
             for approval in approvals:
-                self.notified_approvals.add(approval.id)
-                self.approval_identifiers[approval.id] = approval.identifier
-                if approval.id not in self.approval_timestamps:
-                    self.approval_timestamps[approval.id] = datetime.now().isoformat()
+                key = approval_dedup_key(approval)
+                self.notified_approvals.add(key)
+                self.approval_identifiers[key] = approval.identifier
+                if key not in self.approval_timestamps:
+                    self.approval_timestamps[key] = datetime.now().isoformat()
             self._save_state()
 
     def clear(self):
@@ -975,72 +1021,77 @@ class ApprovalMemory:
         """
         self._ensure_loaded()
         with self._lock:
-            current_ids = {approval.id for approval in approvals}
+            # Reconcile against the SAME stable dedup key used for notification
+            # tracking. Using Keel's volatile UUID id here would evict a
+            # still-valid logical approval every time Keel rotated the id.
+            current_keys = {approval_dedup_key(approval) for approval in approvals}
             now = datetime.now().isoformat()
             for approval in approvals:
-                self.approval_identifiers[approval.id] = approval.identifier
-                if approval.id not in self.approval_timestamps:
-                    self.approval_timestamps[approval.id] = now
+                key = approval_dedup_key(approval)
+                self.approval_identifiers[key] = approval.identifier
+                if key not in self.approval_timestamps:
+                    self.approval_timestamps[key] = now
 
-            ids_to_remove = set(self.approval_identifiers.keys()) - current_ids
-            ids_to_remove.update(set(self.notified_approvals) - current_ids)
-            ids_to_remove.update(set(self.approval_timestamps.keys()) - current_ids)
-            ids_to_remove.update(set(self.auto_approve_failures.keys()) - current_ids)
+            keys_to_remove = set(self.approval_identifiers.keys()) - current_keys
+            keys_to_remove.update(set(self.notified_approvals) - current_keys)
+            keys_to_remove.update(set(self.approval_timestamps.keys()) - current_keys)
+            keys_to_remove.update(set(self.auto_approve_failures.keys()) - current_keys)
 
-            for approval_id in ids_to_remove:
-                identifier = self.approval_identifiers.get(approval_id, approval_id)
-                self.notified_approvals.discard(approval_id)
-                self.approval_timestamps.pop(approval_id, None)
-                self.approval_identifiers.pop(approval_id, None)
-                self.auto_approve_failures.pop(approval_id, None)
-                print(f"[{datetime.now().isoformat()}] Removed stale approval from memory: {identifier} ({approval_id})")
+            for key in keys_to_remove:
+                identifier = self.approval_identifiers.get(key, key)
+                self.notified_approvals.discard(key)
+                self.approval_timestamps.pop(key, None)
+                self.approval_identifiers.pop(key, None)
+                self.auto_approve_failures.pop(key, None)
+                print(f"[{datetime.now().isoformat()}] Removed stale approval from memory: {identifier} ({key})")
 
             self._save_state()
             print(
                 f"[{datetime.now().isoformat()}] Refreshed approval memory: "
-                f"{len(current_ids)} current approvals, {len(self.notified_approvals)} notified approvals tracked, "
-                f"{len(ids_to_remove)} stale approvals removed"
+                f"{len(current_keys)} current approvals, {len(self.notified_approvals)} notified approvals tracked, "
+                f"{len(keys_to_remove)} stale approvals removed"
             )
 
     def remove_approval(self, identifier: str):
         """Remove an approval from tracking (e.g., when it's approved/rejected/archived)."""
         self._ensure_loaded()
         with self._lock:
-            ids_to_remove = [
-                approval_id for approval_id, stored_identifier in self.approval_identifiers.items()
+            keys_to_remove = [
+                key for key, stored_identifier in self.approval_identifiers.items()
                 if stored_identifier == identifier
             ]
-            for approval_id in ids_to_remove:
-                self.notified_approvals.discard(approval_id)
-                self.approval_timestamps.pop(approval_id, None)
-                self.approval_identifiers.pop(approval_id, None)
-                self.auto_approve_failures.pop(approval_id, None)
+            for key in keys_to_remove:
+                self.notified_approvals.discard(key)
+                self.approval_timestamps.pop(key, None)
+                self.approval_identifiers.pop(key, None)
+                self.auto_approve_failures.pop(key, None)
             self._save_state()
-            print(f"[{datetime.now().isoformat()}] Removed '{identifier}' from approval memory ({len(ids_to_remove)} approval id(s))")
+            print(f"[{datetime.now().isoformat()}] Removed '{identifier}' from approval memory ({len(keys_to_remove)} key(s))")
 
     def has_auto_approve_failed(self, approval: Approval) -> bool:
-        """Return whether auto-approval already failed for this approval ID."""
+        """Return whether auto-approval already failed for this logical approval."""
         self._ensure_loaded()
         with self._lock:
-            return approval.id in self.auto_approve_failures
+            return approval_dedup_key(approval) in self.auto_approve_failures
 
     def mark_auto_approve_failed(self, approval: Approval, reason: str):
         """Remember that auto-approval failed so the same approval is not retried in a loop."""
         self._ensure_loaded()
         with self._lock:
-            self.auto_approve_failures[approval.id] = {
+            key = approval_dedup_key(approval)
+            self.auto_approve_failures[key] = {
                 "identifier": approval.identifier,
                 "reason": reason,
                 "failed_at": datetime.now().isoformat(),
             }
-            self.approval_identifiers[approval.id] = approval.identifier
-            if approval.id not in self.approval_timestamps:
-                self.approval_timestamps[approval.id] = datetime.now().isoformat()
-            self.notified_approvals.add(approval.id)
+            self.approval_identifiers[key] = approval.identifier
+            if key not in self.approval_timestamps:
+                self.approval_timestamps[key] = datetime.now().isoformat()
+            self.notified_approvals.add(key)
             self._save_state()
             print(
                 f"[{datetime.now().isoformat()}] Recorded auto-approve failure for "
-                f"{approval.identifier} ({approval.id}): {reason}"
+                f"{approval.identifier} ({key}): {reason}"
             )
 
     def add_auto_approve_target(self, target: str):
@@ -1260,7 +1311,10 @@ async def poll_and_notify(
         print(f"[DRY RUN] Would send to Matrix:")
         print(message)
     else:
-        success = await send_matrix_message(homeserver, user_id, access_token, room_id, message)
+        success = await send_matrix_message(
+            homeserver, user_id, access_token, room_id, message,
+            txn_id=approval_notification_txn_id(new_approvals),
+        )
         if success:
             # Only mark as notified AFTER successful send
             mark_as_notified(new_approvals)
@@ -2093,7 +2147,8 @@ class KeelMatrixBot:
 
         message = "\n".join(summary_lines)
         success = await send_matrix_message(
-            self.homeserver, self.user_id, self.access_token, self.room_id, message
+            self.homeserver, self.user_id, self.access_token, self.room_id, message,
+            txn_id=approval_notification_txn_id(new_approvals),
         )
         if success:
             mark_as_notified(new_approvals)
@@ -2108,7 +2163,7 @@ class KeelMatrixBot:
 
         auto_approved_identifiers = set()
         for approval in approvals:
-            auto_dedup_key = f"auto-approve:{approval.id}"
+            auto_dedup_key = f"auto-approve:{approval_dedup_key(approval)}"
             if auto_dedup_key in self.recently_processed_approvals:
                 print(f"[{datetime.now().isoformat()}] Auto-approve already submitted for {approval.identifier}; waiting for Keel to process it")
                 auto_approved_identifiers.add(approval.identifier)
