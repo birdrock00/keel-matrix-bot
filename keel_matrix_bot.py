@@ -30,7 +30,7 @@ try:
     import asyncpg
 except ImportError:
     asyncpg = None
-from nio import AsyncClient, RoomMessageText
+from nio import AsyncClient, ReactionEvent, RoomMessageText
 
 
 # Build version — set via KEEL_MATRIX_BOT_VERSION env var (injected by Dockerfile/Ansible)
@@ -42,6 +42,18 @@ BUILD_VERSION = os.environ.get("KEEL_MATRIX_BOT_VERSION", "0.0.0-dev")
 # ALWAYS pre-compute this outside the tuple or use in regular string concat.
 SEPARATOR = "─" * 40
 DEFAULT_APPROVE_BASE_URL = os.environ.get("KEEL_MATRIX_BOT_PUBLIC_URL", "http://localhost:8080").rstrip("/")
+
+# Emoji reactions that approve/reject an approval notification. Distinct emojis
+# for distinct actions; any other emoji is ignored. Un-reacting (a redaction)
+# is intentionally NOT treated as a reject.
+REACTION_APPROVE_EMOJI = "👍"
+REACTION_REJECT_EMOJI = "👎"
+REACTION_ACTION_MAP = {
+    "👍": "approve",
+    "✅": "approve",
+    "👎": "reject",
+    "❌": "reject",
+}
 
 
 @dataclass
@@ -249,6 +261,7 @@ def format_approval_message(
     lines.extend([
         "",
         f"[Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})",
+        f"React {REACTION_APPROVE_EMOJI} to approve or {REACTION_REJECT_EMOJI} to reject.",
         f"Reply with `approve {approval.identifier}` or `reject {approval.identifier}` to take action.",
         "",
         "─" * 40
@@ -675,15 +688,21 @@ def format_matrix_html(message: str) -> str:
     return "".join(output).replace("\n", "<br>")
 
 
-async def send_matrix_message(
+async def send_matrix_message_with_event_id(
     homeserver: str,
     user_id: str,
     access_token: str,
     room_id: str,
     message: str,
     txn_id: Optional[str] = None
-) -> bool:
-    """Send a message to a Matrix room using the Matrix REST API directly.
+) -> Tuple[bool, Optional[str]]:
+    """Send a message to a Matrix room, returning ``(success, event_id)``.
+
+    Behaves identically to :func:`send_matrix_message` but also surfaces the
+    Matrix ``event_id`` from the send response so callers (e.g. the approval
+    notification path) can map a later reaction's ``reacts_to`` back to the
+    approval that the message announced. ``event_id`` is ``None`` when the send
+    fails or the homeserver omits it.
 
     When ``txn_id`` is provided it is used as the Matrix transaction id so the
     homeserver collapses accidental re-sends (idempotency). When omitted a fresh
@@ -721,12 +740,89 @@ async def send_matrix_message(
 
             if response.status_code in (200, 201):
                 print(f"[{datetime.now().isoformat()}] [DEBUG] Message sent successfully to room {room_id}")
-                return True
+                event_id = None
+                try:
+                    event_id = response.json().get("event_id")
+                except Exception:
+                    event_id = None
+                return True, event_id
             else:
                 print(f"[{datetime.now().isoformat()}] [DEBUG] Failed to send message: {response.status_code} - {response.text}")
-                return False
+                return False, None
         except Exception as e:
             print(f"[{datetime.now().isoformat()}] [DEBUG] Error sending message: {type(e).__name__}: {e}")
+            return False, None
+
+
+async def send_matrix_message(
+    homeserver: str,
+    user_id: str,
+    access_token: str,
+    room_id: str,
+    message: str,
+    txn_id: Optional[str] = None
+) -> bool:
+    """Send a message to a Matrix room using the Matrix REST API directly.
+
+    Thin ``-> bool`` wrapper around :func:`send_matrix_message_with_event_id`
+    preserved for the many existing callers that only care about success.
+
+    When ``txn_id`` is provided it is used as the Matrix transaction id so the
+    homeserver collapses accidental re-sends (idempotency). When omitted a fresh
+    random transaction id is generated, preserving the previous behavior.
+    """
+    success, _event_id = await send_matrix_message_with_event_id(
+        homeserver, user_id, access_token, room_id, message, txn_id=txn_id
+    )
+    return success
+
+
+async def send_matrix_reaction(
+    homeserver: str,
+    access_token: str,
+    room_id: str,
+    target_event_id: str,
+    emoji: str,
+    txn_id: Optional[str] = None
+) -> bool:
+    """Send an ``m.reaction`` annotation onto an existing event.
+
+    Used to pre-seed 👍/👎 reactions on the bot's own approval message so the
+    user can simply tap one. Best-effort: failures are logged and ignored so a
+    reaction-seeding hiccup never blocks the approval notification itself.
+    """
+    import uuid
+    if txn_id is None:
+        txn_id = uuid.uuid4().hex
+
+    url = f"{homeserver.rstrip('/')}/_matrix/client/v3/rooms/{room_id}/send/m.reaction/{txn_id}"
+    payload = {
+        "m.relates_to": {
+            "rel_type": "m.annotation",
+            "event_id": target_event_id,
+            "key": emoji,
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            response = await client.put(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            if response.status_code in (200, 201):
+                return True
+            print(
+                f"[{datetime.now().isoformat()}] [DEBUG] Failed to seed reaction {emoji}: "
+                f"{response.status_code} - {response.text}"
+            )
+            return False
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] [DEBUG] Error seeding reaction {emoji}: {type(e).__name__}: {e}")
             return False
 
 
@@ -790,6 +886,9 @@ class ApprovalMemory:
     - release_notes_urls: Map of approval identifier to release notes URL
     - auto_approve_targets: Set of keywords to auto-approve when seen in pending approvals
     - auto_approve_failures: Map of dedup key to the first failed auto-approve attempt
+    - reaction_targets: Map of Matrix event_id (the approval notification message) to
+      approval identifier, so an emoji reaction can be resolved back to an approval
+      even after a pod restart
     """
 
     def __init__(self):
@@ -802,6 +901,7 @@ class ApprovalMemory:
         self.release_notes_urls: dict = {}  # identifier -> release_notes_url
         self.auto_approve_targets: set = set()  # keywords/identifiers to auto-approve
         self.auto_approve_failures: dict = {}  # dedup_key -> failure details
+        self.reaction_targets: dict = {}  # matrix event_id -> approval identifier
 
     def _database_config_from_env(self) -> Optional[dict]:
         """Return PostgreSQL settings only when explicitly configured."""
@@ -929,6 +1029,7 @@ class ApprovalMemory:
         self.release_notes_urls = data.get('release_notes_urls', {})
         self.auto_approve_targets = set(data.get('auto_approve_targets', []))
         self.auto_approve_failures = data.get('auto_approve_failures', {})
+        self.reaction_targets = data.get('reaction_targets', {})
 
     def _reset_state(self):
         self.notified_approvals = set()
@@ -937,6 +1038,7 @@ class ApprovalMemory:
         self.release_notes_urls = {}
         self.auto_approve_targets = set()
         self.auto_approve_failures = {}
+        self.reaction_targets = {}
 
     def _load_state(self):
         """Load state from PostgreSQL."""
@@ -965,7 +1067,8 @@ class ApprovalMemory:
             'approval_identifiers': self.approval_identifiers,
             'release_notes_urls': self.release_notes_urls,
             'auto_approve_targets': sorted(self.auto_approve_targets),
-            'auto_approve_failures': self.auto_approve_failures
+            'auto_approve_failures': self.auto_approve_failures,
+            'reaction_targets': self.reaction_targets
         }
         self._run_db_with_pool(lambda pool: self._save_all_to_db(pool, data))
 
@@ -1156,6 +1259,30 @@ class ApprovalMemory:
 
         return normalized_identifier
 
+    def record_reaction_target(self, event_id: str, identifier: str):
+        """Persist a mapping from an approval notification's Matrix event_id to
+        its approval identifier so a later emoji reaction can be resolved back to
+        the approval, including after a pod restart.
+        """
+        if not event_id or not identifier:
+            return
+        self._ensure_loaded()
+        with self._lock:
+            self.reaction_targets[event_id] = identifier
+            # Bound growth; keep the most recently inserted entries.
+            if len(self.reaction_targets) > 500:
+                recent = list(self.reaction_targets.items())[-250:]
+                self.reaction_targets = dict(recent)
+            self._save_state()
+
+    def get_reaction_target(self, event_id: str) -> Optional[str]:
+        """Return the approval identifier mapped to a notification event_id, if any."""
+        if not event_id:
+            return None
+        self._ensure_loaded()
+        with self._lock:
+            return self.reaction_targets.get(event_id)
+
 
 # Global approval memory instance
 approval_memory = ApprovalMemory()
@@ -1176,6 +1303,14 @@ def clear_notified_approvals():
 def remove_from_memory(identifier: str):
     """Remove an approval from memory (e.g., when it's been approved/rejected)."""
     approval_memory.remove_approval(identifier)
+
+def record_reaction_target(event_id: str, identifier: str):
+    """Map an approval notification's Matrix event_id to its approval identifier."""
+    approval_memory.record_reaction_target(event_id, identifier)
+
+def get_reaction_target(event_id: str) -> Optional[str]:
+    """Return the approval identifier mapped to a notification event_id, if any."""
+    return approval_memory.get_reaction_target(event_id)
 
 def has_auto_approve_failed(approval: Approval) -> bool:
     """Return whether auto-approval already failed for this approval ID."""
@@ -1754,6 +1889,7 @@ class KeelMatrixBot:
         # Register callback only after we have the startup next_batch token.
         # From now on we sync with `since=next_batch`, so only NEW commands are processed.
         self.client.add_event_callback(self.on_message, RoomMessageText)
+        self.client.add_event_callback(self.on_reaction, ReactionEvent)
 
         print(
             f"[{datetime.now().isoformat()}] Bot listening for messages in room "
@@ -1800,6 +1936,78 @@ class KeelMatrixBot:
         finally:
             if self.nightly_scheduler_task:
                 self.nightly_scheduler_task.cancel()
+
+    async def _resolve_reaction_identifier(self, reacts_to: str) -> Optional[str]:
+        """Resolve the reacted-to notification event_id to an approval identifier.
+
+        Prefers the persisted ``event_id -> identifier`` mapping (survives pod
+        restarts). On a mapping miss, falls back to re-fetching pending approvals
+        and, when exactly one is pending, uses it (the bot already re-fetches and
+        matches in several handlers). Returns ``None`` when it cannot resolve.
+        """
+        identifier = get_reaction_target(reacts_to)
+        if identifier:
+            return identifier
+
+        # Fallback: mapping missed (e.g. message predates this feature). If exactly
+        # one approval is pending, it is unambiguous which one the user meant.
+        try:
+            approvals, raw_response = await fetch_pending_approvals(
+                self.keel_url, self.keel_username, self.keel_password
+            )
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Reaction fallback fetch failed: {type(e).__name__}: {e}")
+            return None
+
+        if raw_response.get("error"):
+            return None
+        if len(approvals) == 1:
+            return approvals[0].identifier
+        return None
+
+    async def on_reaction(self, room, event):
+        """Approve/reject an approval when the user reacts with an emoji.
+
+        Maps the reaction's ``reacts_to`` (the approval notification message's
+        event_id) back to an approval identifier and reuses the existing
+        ``handle_approve_reject`` path, which performs the real Keel API call and
+        handles 404/stale/confirmation messaging.
+        """
+        # Ignore our own reactions (including the pre-seeded 👍/👎).
+        if event.sender == self.user_id:
+            return
+
+        # Dedup: reactions carry their own event_id.
+        if event.event_id in self.processed_events:
+            return
+        self.processed_events.add(event.event_id)
+        if len(self.processed_events) > 1000:
+            self.processed_events = set(list(self.processed_events)[-500:])
+
+        emoji = getattr(event, "key", None)
+        reacts_to = getattr(event, "reacts_to", None)
+        if not emoji or not reacts_to:
+            return
+
+        action = REACTION_ACTION_MAP.get(emoji)
+        if action is None:
+            # Some other emoji; ignore quietly.
+            return
+
+        identifier = await self._resolve_reaction_identifier(reacts_to)
+        if not identifier:
+            # Could not map the reaction back to an approval; ignore quietly.
+            print(
+                f"[{datetime.now().isoformat()}] Reaction {emoji} on {reacts_to} from "
+                f"{event.sender} did not resolve to an approval; ignoring"
+            )
+            return
+
+        print(
+            f"[{datetime.now().isoformat()}] Reaction {emoji} from {event.sender} -> "
+            f"{action} `{identifier}`"
+        )
+        await self.handle_approve_reject(room.room_id, identifier, action)
 
     async def on_message(self, room, event):
         """Handle incoming Matrix messages."""
@@ -1851,6 +2059,7 @@ class KeelMatrixBot:
                 "• If multiple matches are found, the bot will list them for disambiguation\n"
                 "• Auto-approve runs every 30 seconds on pending approvals\n"
                 "• Click the [Approve] links in approval messages for one-click approval\n"
+                "• React 👍/✅ to approve or 👎/❌ to reject an approval message — no browser needed\n"
                 "\n"
                 f"{SEPARATOR}"
             )
@@ -2136,25 +2345,55 @@ class KeelMatrixBot:
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         response_status = raw_response.get("status", "N/A")
-        summary_lines = [
+
+        # Send a short header followed by ONE message per approval. The per-approval
+        # message is what users react to, so its Matrix event_id is mapped back to the
+        # approval identifier (persisted) for the emoji-reaction approval flow.
+        header = "\n".join([
             f"📦 **Keel Approval Alert** ({now})",
             f"**HTTP Status:** {response_status}",
             f"**Pending approvals:** {len(new_approvals)}",
-            "",
-        ]
-        for approval in new_approvals:
-            summary_lines.append(format_approval_message(approval, self.public_base_url))
-
-        message = "\n".join(summary_lines)
-        success = await send_matrix_message(
-            self.homeserver, self.user_id, self.access_token, self.room_id, message,
-            txn_id=approval_notification_txn_id(new_approvals),
+        ])
+        await send_matrix_message(
+            self.homeserver, self.user_id, self.access_token, self.room_id, header,
+            txn_id=f"{approval_notification_txn_id(new_approvals)}-header",
         )
-        if success:
-            mark_as_notified(new_approvals)
-            print(f"[{datetime.now().isoformat()}] Successfully notified about {len(new_approvals)} approvals")
-        else:
-            print(f"[{datetime.now().isoformat()}] Failed to send notification, will retry on next poll")
+
+        notified = 0
+        for approval in new_approvals:
+            message = format_approval_message(approval, self.public_base_url)
+            success, event_id = await send_matrix_message_with_event_id(
+                self.homeserver, self.user_id, self.access_token, self.room_id, message,
+                txn_id=approval_notification_txn_id(approval),
+            )
+            if not success:
+                print(
+                    f"[{datetime.now().isoformat()}] Failed to send notification for "
+                    f"{approval.identifier}, will retry on next poll"
+                )
+                continue
+
+            # Only mark as notified AFTER a successful send so a failed send retries.
+            mark_as_notified([approval])
+            notified += 1
+            if event_id:
+                record_reaction_target(event_id, approval.identifier)
+                # Pre-seed 👍/👎 so the user can just tap one (best-effort).
+                await send_matrix_reaction(
+                    self.homeserver, self.access_token, self.room_id,
+                    event_id, REACTION_APPROVE_EMOJI,
+                )
+                await send_matrix_reaction(
+                    self.homeserver, self.access_token, self.room_id,
+                    event_id, REACTION_REJECT_EMOJI,
+                )
+            else:
+                print(
+                    f"[{datetime.now().isoformat()}] No event_id returned for "
+                    f"{approval.identifier}; emoji reactions will rely on identifier fallback"
+                )
+
+        print(f"[{datetime.now().isoformat()}] Successfully notified about {notified} approvals")
 
     async def auto_approve_matching_approvals(self, room_id: str, approvals: list[Approval]) -> set[str]:
         """Auto-approve approvals whose identifier matches configured auto targets."""
