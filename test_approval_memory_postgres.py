@@ -88,6 +88,38 @@ class ApprovalMemoryPostgresTests(unittest.TestCase):
         self.assertEqual(memory.release_notes_urls["app"], "https://example.com/releases")
         self.assertEqual(memory.auto_approve_failures["approval-2"]["reason"], "404")
 
+    def test_legacy_id_based_rows_load_without_error_and_do_not_match(self):
+        """Old persisted state was keyed by Keel's volatile UUID id. After the
+        switch to stable dedup keys those rows still load fine (schema is
+        unchanged) but simply never match a live approval, so they are harmless
+        and get reconciled away on the next refresh."""
+        memory = ApprovalMemory()
+        memory._apply_state(
+            {
+                "notified_approvals": ["legacy-uuid-1234"],
+                "approval_identifiers": {"legacy-uuid-1234": "deployment/app/app:latest"},
+            }
+        )
+
+        memory._loaded = True
+        memory._save_state = lambda: None
+
+        live = keel_matrix_bot.Approval(
+            id="fresh-uuid-9999",
+            provider="kubernetes",
+            identifier="deployment/app/app:latest",
+            message="m",
+            current_version="1.0.0",
+            new_version="1.0.1",
+            created_at="2026-06-23T00:00:00Z",
+        )
+
+        # Legacy id row must not suppress the genuinely new logical update.
+        self.assertFalse(memory.is_approved(live))
+        # Reconciliation drops the orphaned legacy entry.
+        memory.refresh_from_approvals([live])
+        self.assertNotIn("legacy-uuid-1234", memory.notified_approvals)
+
     def test_reset_state_clears_all_persistent_fields(self):
         memory = ApprovalMemory()
         memory.notified_approvals = {"approval-1"}
