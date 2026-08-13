@@ -2127,6 +2127,54 @@ class KeelMatrixBot:
             print(f"[{datetime.now().isoformat()}] Detected 'keel set-auto' command for: {target}")
             await self.handle_set_auto(room.room_id, target)
 
+    async def _send_approval_messages(
+        self, room_id: str, approvals: list[Approval], header: str
+    ) -> list[Approval]:
+        """Send a header plus one Matrix message per approval with 👍/👎 reactions.
+
+        Each per-approval message is a distinct Matrix event whose event_id is
+        mapped back to its approval identifier (persisted) so a later emoji
+        reaction resolves to the right approval. The 👍/👎 reactions are
+        pre-seeded (best-effort) so users can tap one without a browser.
+
+        Returns the approvals whose message was sent successfully.
+        """
+        await send_matrix_message(
+            self.homeserver, self.user_id, self.access_token, room_id, header,
+        )
+
+        notified = []
+        for approval in approvals:
+            message = format_approval_message(approval, self.public_base_url)
+            success, event_id = await send_matrix_message_with_event_id(
+                self.homeserver, self.user_id, self.access_token, room_id, message,
+            )
+            if not success:
+                print(
+                    f"[{datetime.now().isoformat()}] Failed to send message for "
+                    f"{approval.identifier}; skipping"
+                )
+                continue
+
+            notified.append(approval)
+            if event_id:
+                record_reaction_target(event_id, approval.identifier)
+                # Pre-seed 👍/👎 so the user can just tap one (best-effort).
+                await send_matrix_reaction(
+                    self.homeserver, self.access_token, room_id,
+                    event_id, REACTION_APPROVE_EMOJI,
+                )
+                await send_matrix_reaction(
+                    self.homeserver, self.access_token, room_id,
+                    event_id, REACTION_REJECT_EMOJI,
+                )
+            else:
+                print(
+                    f"[{datetime.now().isoformat()}] No event_id returned for "
+                    f"{approval.identifier}; emoji reactions will rely on identifier fallback"
+                )
+        return notified
+
     async def handle_get_approvals(self, room_id: str):
         """Handle the 'keel get approvals' command by fetching and displaying approvals."""
         sending_msg = "🔄 Fetching approvals from Keel..."
@@ -2151,27 +2199,29 @@ class KeelMatrixBot:
                 f"\n"
                 f"{SEPARATOR}"
             )
-        else:
-            # Pass approval_timestamps to show days since first seen
-            response_msg = format_approvals_list(
-                approvals,
-                get_approval_timestamps(),
-                approve_base_url=self.public_base_url
+            await send_matrix_message(
+                self.homeserver, self.user_id, self.access_token,
+                room_id, response_msg
             )
-            # Add HTTP status to the top
-            response_lines = response_msg.split("\n")
-            # Insert status after the first line
-            for i, line in enumerate(response_lines):
-                if line.startswith("📋 **Pending Approvals"):
-                    response_lines.insert(1, f"**HTTP Status:** {response_status}")
-                    response_lines.insert(2, "")
-                    break
-            response_msg = "\n".join(response_lines)
+            return
 
-        await send_matrix_message(
-            self.homeserver, self.user_id, self.access_token,
-            room_id, response_msg
-        )
+        if not approvals:
+            await send_matrix_message(
+                self.homeserver, self.user_id, self.access_token,
+                room_id, "✅ No pending approvals at this time."
+            )
+            return
+
+        # Send one message per approval (like new-approval notifications) so each
+        # individual record gets pre-seeded 👍/👎 reactions that resolve back to it.
+        header = "\n".join([
+            f"📋 **Pending Approvals ({len(approvals)})**",
+            f"**HTTP Status:** {response_status}",
+            "",
+            f"Each approval below is its own message — react {REACTION_APPROVE_EMOJI} "
+            f"to approve or {REACTION_REJECT_EMOJI} to reject it.",
+        ])
+        await self._send_approval_messages(room_id, approvals, header)
 
     async def handle_get_auto(self, room_id: str):
         """Handle the 'keel get auto' command by listing auto-approve image targets."""
@@ -2359,39 +2409,13 @@ class KeelMatrixBot:
             txn_id=f"{approval_notification_txn_id(new_approvals)}-header",
         )
 
-        notified = 0
-        for approval in new_approvals:
-            message = format_approval_message(approval, self.public_base_url)
-            success, event_id = await send_matrix_message_with_event_id(
-                self.homeserver, self.user_id, self.access_token, self.room_id, message,
-                txn_id=approval_notification_txn_id(approval),
-            )
-            if not success:
-                print(
-                    f"[{datetime.now().isoformat()}] Failed to send notification for "
-                    f"{approval.identifier}, will retry on next poll"
-                )
-                continue
-
+        notified_approvals = await self._send_approval_messages(
+            self.room_id, new_approvals, header
+        )
+        notified = len(notified_approvals)
+        if notified_approvals:
             # Only mark as notified AFTER a successful send so a failed send retries.
-            mark_as_notified([approval])
-            notified += 1
-            if event_id:
-                record_reaction_target(event_id, approval.identifier)
-                # Pre-seed 👍/👎 so the user can just tap one (best-effort).
-                await send_matrix_reaction(
-                    self.homeserver, self.access_token, self.room_id,
-                    event_id, REACTION_APPROVE_EMOJI,
-                )
-                await send_matrix_reaction(
-                    self.homeserver, self.access_token, self.room_id,
-                    event_id, REACTION_REJECT_EMOJI,
-                )
-            else:
-                print(
-                    f"[{datetime.now().isoformat()}] No event_id returned for "
-                    f"{approval.identifier}; emoji reactions will rely on identifier fallback"
-                )
+            mark_as_notified(notified_approvals)
 
         print(f"[{datetime.now().isoformat()}] Successfully notified about {notified} approvals")
 
