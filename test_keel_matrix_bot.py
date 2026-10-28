@@ -23,9 +23,11 @@ from keel_matrix_bot import (
     approval_notification_txn_id,
     format_approval_message,
     format_approvals_list,
+    format_voter_line,
     get_action_gerund,
     get_approval_action_url,
     get_deny_action_url,
+    parse_approvals,
     render_async_approval_action_page,
     send_matrix_message_with_event_id,
 )
@@ -451,6 +453,252 @@ class ApprovalMessageReactionHintTests(unittest.TestCase):
         message = format_approval_message(sample_approval(), "https://bot.example")
         self.assertIn("React 👍 to approve", message)
         self.assertIn("👎 to reject", message)
+
+
+class ApprovalVoteStateTests(unittest.TestCase):
+    def test_parse_approvals_captures_vote_state(self):
+        approvals = parse_approvals([{
+            "id": "uuid-1",
+            "provider": "kubernetes",
+            "identifier": "ns/app:1",
+            "message": "New image available",
+            "currentVersion": "1",
+            "newVersion": "2",
+            "createdAt": "2026-05-31T12:34:56Z",
+            "votesRequired": 1,
+            "votesReceived": 1,
+            "rejected": False,
+            "voters": {"@bot:example": "2026-05-31T12:35:00.123456789Z"},
+            "event": {"repository": {"name": "example/app", "tag": "2"}},
+        }])
+        self.assertEqual(len(approvals), 1)
+        approved = approvals[0]
+        self.assertEqual(approved.votes_required, 1)
+        self.assertEqual(approved.votes_received, 1)
+        self.assertTrue(approved.is_fully_voted())
+        self.assertFalse(approved.needs_action())
+        self.assertEqual(approved.status_label(), "Approved")
+        self.assertIn("@bot:example", approved.voters)
+
+    def test_parse_approvals_defaults_to_pending_without_vote_fields(self):
+        approvals = parse_approvals([{
+            "id": "uuid-2",
+            "identifier": "ns/app:1",
+            "message": "m",
+            "currentVersion": "1",
+            "newVersion": "2",
+        }])
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0].votes_received, 0)
+        self.assertTrue(approvals[0].needs_action())
+        self.assertEqual(approvals[0].status_label(), "Pending")
+
+    def test_rejected_approval_does_not_need_action(self):
+        approval = sample_approval()
+        approval.rejected = True
+        self.assertFalse(approval.needs_action())
+        self.assertFalse(approval.is_fully_voted())
+        self.assertEqual(approval.status_label(), "Rejected")
+
+    def test_partial_votes_still_need_action(self):
+        approval = sample_approval()
+        approval.votes_required = 2
+        approval.votes_received = 1
+        self.assertTrue(approval.needs_action())
+        self.assertEqual(approval.status_label(), "Pending")
+
+    def test_voter_line_lists_voters_and_latest_vote_time(self):
+        approval = sample_approval()
+        approval.voters = {"@bot:example": "2026-05-31T12:35:00.123456789Z"}
+        line = format_voter_line(approval)
+        self.assertIn("@bot:example", line)
+        self.assertIn("2026-05-31T12:35:00", line)
+        self.assertEqual(format_voter_line(sample_approval()), "")
+
+
+class ResolvedApprovalMessageTests(unittest.TestCase):
+    def test_approved_approval_message_has_no_action_links(self):
+        approval = sample_approval()
+        approval.votes_received = 1
+        approval.voters = {"@bot:example": "2026-05-31T12:35:00Z"}
+
+        message = format_approval_message(approval, "https://bot.example")
+
+        self.assertIn("Approved — Awaiting Rollout", message)
+        self.assertIn("No action needed", message)
+        self.assertIn("**Status:** Approved (1/1 votes)", message)
+        self.assertNotIn("[Approve app]", message)
+        self.assertNotIn("[Deny approval app]", message)
+        self.assertNotIn("`approve namespace/deployment/app:1.2.3`", message)
+
+    def test_rejected_approval_message_has_no_action_links(self):
+        approval = sample_approval()
+        approval.rejected = True
+
+        message = format_approval_message(approval, "https://bot.example")
+
+        self.assertIn("Approval Rejected", message)
+        self.assertNotIn("[Approve app]", message)
+        self.assertNotIn("[Deny approval app]", message)
+
+    def test_approvals_list_only_offers_links_for_pending(self):
+        pending = sample_approval("ns/app:1")
+        done = sample_approval("ns/done:1")
+        done.votes_received = 1
+
+        message = format_approvals_list([pending, done], approve_base_url="https://bot.example")
+
+        self.assertIn("📋 **Approvals (2)**", message)
+        self.assertIn("[Approve app](https://bot.example/approve?identifier=ns%2Fapp%3A1)", message)
+        self.assertIn("Status: Approved (1/1 votes)", message)
+        self.assertIn("No action needed — this approval is already complete.", message)
+        self.assertNotIn("identifier=ns%2Fdone%3A1", message)
+
+    def test_approvals_list_keeps_pending_title_when_all_need_action(self):
+        message = format_approvals_list([sample_approval()], approve_base_url="https://bot.example")
+        self.assertIn("📋 **Pending Approvals (1)**", message)
+
+
+class AlreadyApprovedActionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._patcher = patch.object(keel_matrix_bot, "approval_memory", loaded_memory())
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+    async def test_http_approve_on_already_approved_is_noop(self):
+        bot = make_bot()
+        calls = []
+
+        async def fake_handle(room_id, identifier, action):
+            calls.append((room_id, identifier, action))
+
+        bot.handle_approve_reject = fake_handle
+        approved = sample_approval("ns/app:1")
+        approved.votes_received = 1
+
+        async def fake_fetch_pending_approvals(*args, **kwargs):
+            return [approved], {"status": 200}
+
+        with patch.object(keel_matrix_bot, "fetch_pending_approvals", new=fake_fetch_pending_approvals):
+            status_code, message = await bot.process_http_approval_action_request("ns/app:1", "approve")
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(calls, [])
+        self.assertIn("already approved", message)
+        self.assertIn("No approval submitted", message)
+
+    async def test_http_reject_on_already_approved_is_noop(self):
+        bot = make_bot()
+        calls = []
+
+        async def fake_handle(room_id, identifier, action):
+            calls.append((room_id, identifier, action))
+
+        bot.handle_approve_reject = fake_handle
+        approved = sample_approval("ns/app:1")
+        approved.votes_received = 1
+
+        async def fake_fetch_pending_approvals(*args, **kwargs):
+            return [approved], {"status": 200}
+
+        with patch.object(keel_matrix_bot, "fetch_pending_approvals", new=fake_fetch_pending_approvals):
+            status_code, message = await bot.process_http_approval_action_request("ns/app:1", "deny")
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(calls, [])
+        self.assertIn("already approved", message)
+
+    async def test_handle_approve_reject_short_circuits_already_approved(self):
+        bot = make_bot()
+        approved = sample_approval()
+        approved.votes_received = 1
+        sent = []
+
+        async def fake_send(homeserver, user_id, access_token, room_id, message, txn_id=None):
+            sent.append(message)
+            return True
+
+        async def fake_fetch(*args, **kwargs):
+            return [approved], {"status": 200}
+
+        with patch.object(keel_matrix_bot, "send_matrix_message", new=fake_send), \
+             patch.object(keel_matrix_bot, "fetch_pending_approvals", new=fake_fetch):
+            status, message = await bot.handle_approve_reject(
+                "!room:example", approved.identifier, "approve"
+            )
+
+        self.assertEqual(status, 200)
+        self.assertIn("Already approved — no action needed", message)
+        self.assertFalse(any("Approve submitted" in m for m in sent))
+
+
+class GetApprovalsResolutionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._patcher = patch.object(keel_matrix_bot, "approval_memory", loaded_memory())
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+    def _patch_sinks(self, sent):
+        async def fake_send(homeserver, user_id, access_token, room_id, message, txn_id=None):
+            sent.append(message)
+            return True
+
+        async def fake_send_with_event_id(homeserver, user_id, access_token, room_id, message, txn_id=None):
+            sent.append(message)
+            return True, "$evt:1"
+
+        async def fake_reaction(*args, **kwargs):
+            return True
+
+        return (
+            patch.object(keel_matrix_bot, "send_matrix_message", new=fake_send),
+            patch.object(keel_matrix_bot, "send_matrix_message_with_event_id", new=fake_send_with_event_id),
+            patch.object(keel_matrix_bot, "send_matrix_reaction", new=fake_reaction),
+        )
+
+    async def test_pending_and_resolved_approvals_are_shown_separately(self):
+        bot = make_bot()
+        pending = sample_approval("ns/app:1")
+        done = sample_approval("ns/done:1")
+        done.votes_received = 1
+        sent = []
+
+        async def fake_fetch(*args, **kwargs):
+            return [pending, done], {"status": 200}
+
+        send_patch, send_event_patch, reaction_patch = self._patch_sinks(sent)
+        with send_patch, send_event_patch, reaction_patch, \
+             patch.object(keel_matrix_bot, "fetch_pending_approvals", new=fake_fetch):
+            await bot.handle_get_approvals("!room:example")
+
+        joined = "\n".join(sent)
+        self.assertIn("📋 **Pending Approvals (1)**", joined)
+        self.assertIn("Already approved (1): `ns/done:1`", joined)
+        self.assertIn("No action needed (1)", joined)
+        # One actionable message for the pending approval only.
+        self.assertTrue(any("Update Approval Required" in m and "ns/app:1" in m for m in sent))
+        self.assertFalse(any("Update Approval Required" in m and "ns/done:1" in m for m in sent))
+        # Header is not duplicated.
+        self.assertEqual(sum(1 for m in sent if "Pending Approvals (1)" in m), 1)
+
+    async def test_all_resolved_list_shows_no_pending_and_no_requests(self):
+        bot = make_bot()
+        done = sample_approval("ns/done:1")
+        done.votes_received = 1
+        sent = []
+
+        async def fake_fetch(*args, **kwargs):
+            return [done], {"status": 200}
+
+        send_patch, send_event_patch, reaction_patch = self._patch_sinks(sent)
+        with send_patch, send_event_patch, reaction_patch, \
+             patch.object(keel_matrix_bot, "fetch_pending_approvals", new=fake_fetch):
+            await bot.handle_get_approvals("!room:example")
+
+        joined = "\n".join(sent)
+        self.assertIn("No Pending Approvals", joined)
+        self.assertIn("No action needed (1)", joined)
+        self.assertFalse(any("Update Approval Required" in m for m in sent))
 
 
 if __name__ == "__main__":

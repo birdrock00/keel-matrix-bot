@@ -71,6 +71,34 @@ class Approval:
     repository_tag: str = ""
     repository_digest: str = ""
     archived: bool = False
+    votes_required: int = 1
+    votes_received: int = 0
+    rejected: bool = False
+    voters: dict = field(default_factory=dict)
+
+    def is_fully_voted(self) -> bool:
+        """Return True when every required approval vote has been cast (and it was not rejected)."""
+        return self.votes_received >= max(1, self.votes_required) and not self.rejected
+
+    def needs_action(self) -> bool:
+        """Return True when this approval still requires an approval vote."""
+        return (not self.rejected) and (self.votes_received < self.votes_required)
+
+    def status_label(self) -> str:
+        """Return a short human-readable status for this approval."""
+        if self.rejected:
+            return "Rejected"
+        if self.is_fully_voted():
+            return "Approved"
+        return "Pending"
+
+
+def to_int(value, default: int = 0) -> int:
+    """Coerce a JSON value to int, falling back to ``default``."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 async def login_to_matrix(homeserver: str, username: str, password: str) -> Tuple[Optional[str], Optional[str]]:
@@ -114,6 +142,13 @@ def parse_approvals(data: list) -> list[Approval]:
     Keel's approvals endpoint can include archived records. Those records are
     historical and are not approvable; treating them as pending causes repeated
     404s when the bot tries to approve them.
+
+    The endpoint also reports per-approval vote state (``votesRequired``,
+    ``votesReceived``, ``voters``, ``rejected``). Keel keeps approvals that
+    are already approved but not yet applied in the (unarchived) list until the
+    rollout completes or the approval deadline passes, so the vote state must
+    be tracked: without it, already-confirmed updates are rendered again as
+    "approval required" requests.
     """
     approvals = []
     archived_count = 0
@@ -137,6 +172,10 @@ def parse_approvals(data: list) -> list[Approval]:
             repository_tag=repository.get('tag', ''),
             repository_digest=repository.get('digest', ''),
             archived=False,
+            votes_required=to_int(item.get('votesRequired'), 1),
+            votes_received=to_int(item.get('votesReceived'), 0),
+            rejected=bool(item.get('rejected', False)),
+            voters=dict(item.get('voters') or {}),
         )
         approvals.append(approval)
 
@@ -221,12 +260,65 @@ def format_release_notes_line(target, label: str = "Release Notes") -> str:
     return f"📝 {label} ({release_notes_key}): {get_release_notes_url(target)}"
 
 
+def format_voter_line(approval: Approval) -> str:
+    """Format a short line describing who voted on an approval and when."""
+    if not approval.voters:
+        return ""
+    try:
+        voters = ", ".join(sorted(str(v) for v in approval.voters))
+        latest = max(str(ts) for ts in approval.voters.values())[:19]
+        return f"🗳 Voted by: {voters} at {latest}"
+    except Exception:
+        return ""
+
+
 def format_approval_message(
     approval: Approval,
     approve_base_url: str = DEFAULT_APPROVE_BASE_URL,
 ) -> str:
-    """Format an approval as a readable Matrix message."""
+    """Format an approval as a readable Matrix message.
+
+    Approvals that are already fully approved or rejected are rendered as
+    status-only messages without Approve/Deny links so already-confirmed
+    updates are never presented as if they still need approval.
+    """
     effective_image = get_effective_image_reference(approval)
+
+    if approval.is_fully_voted() or approval.rejected:
+        if approval.rejected:
+            title = "🚫 **Approval Rejected**"
+            note = "This approval was rejected; Keel will not roll out this update."
+        else:
+            title = "✅ **Approved — Awaiting Rollout**"
+            note = ("Already approved; Keel will roll this out automatically. "
+                    "No action needed.")
+        lines = [
+            title,
+            "",
+            f"**Application:** `{approval.identifier}`",
+        ]
+        if effective_image:
+            lines.append(f"**Image:** `{effective_image}`")
+        lines.extend([
+            f"**Update:** `{approval.current_version}` → `{approval.new_version}`",
+            f"**Provider:** {approval.provider}",
+            f"**Status:** {approval.status_label()} ({approval.votes_received}/{approval.votes_required} votes)",
+            "",
+            f"__{approval.message}__",
+            "",
+            f"🕐 Created: {approval.created_at[:19]}" if approval.created_at else "",
+        ])
+        voter_line = format_voter_line(approval)
+        if voter_line:
+            lines.append(voter_line)
+        lines.extend([
+            note,
+            format_release_notes_line(approval, "Release Notes URL"),
+            "",
+            "─" * 40,
+        ])
+        return "\n".join(line for line in lines if line)
+
     approve_url = get_approval_action_url(approval.identifier, "approve", approve_base_url)
     deny_url = get_approval_action_url(approval.identifier, "deny", approve_base_url)
     image_name = get_image_name_from_identifier(approval.identifier)
@@ -540,8 +632,13 @@ def format_approvals_list(
     if not approvals:
         return "✅ No pending approvals at this time."
 
+    if all(approval.needs_action() for approval in approvals):
+        title = f"📋 **Pending Approvals ({len(approvals)})**"
+    else:
+        title = f"📋 **Approvals ({len(approvals)})**"
+
     lines = [
-        f"📋 **Pending Approvals ({len(approvals)})**",
+        title,
         "",
     ]
 
@@ -570,6 +667,7 @@ def format_approvals_list(
             f"**{i}. {approval.identifier}**",
             f"   Update: `{approval.current_version}` → `{approval.new_version}`",
             f"   Provider: {approval.provider}",
+            f"   Status: {approval.status_label()} ({approval.votes_received}/{approval.votes_required} votes)",
             f"   Created: {approval.created_at[:19] if approval.created_at else 'Unknown'}",
         ])
 
@@ -577,10 +675,13 @@ def format_approvals_list(
         if effective_image:
             lines.append(f"   Image: `{effective_image}`")
 
-        approve_url = get_approve_action_url(approval.identifier, approve_base_url)
-        deny_url = get_deny_action_url(approval.identifier, approve_base_url)
-        image_name = get_image_name_from_identifier(approval.identifier)
-        lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})")
+        if approval.needs_action():
+            approve_url = get_approve_action_url(approval.identifier, approve_base_url)
+            deny_url = get_deny_action_url(approval.identifier, approve_base_url)
+            image_name = get_image_name_from_identifier(approval.identifier)
+            lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})")
+        else:
+            lines.append("   No action needed — this approval is already complete.")
 
         if days_pending:
             lines.append(f"   {days_pending}")
@@ -1418,8 +1519,9 @@ async def poll_and_notify(
     # Reconcile current approvals so stale entries do not suppress future alerts.
     approval_memory.refresh_from_approvals(approvals)
 
-    # Only send notifications for NEW approvals (not already notified)
-    new_approvals = get_new_approvals(approvals)
+    # Only send notifications for NEW approvals that still require action
+    # (already-approved or rejected approvals are status, not requests).
+    new_approvals = [a for a in get_new_approvals(approvals) if a.needs_action()]
 
     if not new_approvals:
         print(f"[{datetime.now().isoformat()}] No new approvals to notify about.")
@@ -1534,7 +1636,7 @@ async def send_daily_summary(
             approve_base_url=approve_base_url
         )
         approval_lines = approval_list.split("\n")
-        if approval_lines and approval_lines[0].startswith("📋 **Pending Approvals"):
+        if approval_lines and approval_lines[0].startswith("📋"):
             approval_lines = approval_lines[2:]
         summary_lines.extend(approval_lines)
         message = "\n".join(summary_lines)
@@ -1703,6 +1805,23 @@ class KeelMatrixBot:
                 200,
                 f"No pending approval remains for '{clean_identifier}'. "
                 f"It was already processed or expired; no {get_action_noun(normalized_action)} was submitted."
+            )
+
+        matching = next(
+            (a for a in approvals if a.identifier == clean_identifier), None
+        )
+        if matching is not None and not matching.needs_action():
+            state = "rejected" if matching.rejected else "approved"
+            detail = (
+                "Keel will not roll out this update."
+                if matching.rejected
+                else "Keel will roll it out automatically."
+            )
+            return (
+                200,
+                f"No {get_action_noun(normalized_action)} submitted: "
+                f"'{clean_identifier}' is already {state} "
+                f"({matching.votes_received}/{matching.votes_required} votes). {detail}"
             )
 
         # Reuse existing approval flow so behavior stays consistent with Matrix commands.
@@ -2128,20 +2247,22 @@ class KeelMatrixBot:
             await self.handle_set_auto(room.room_id, target)
 
     async def _send_approval_messages(
-        self, room_id: str, approvals: list[Approval], header: str
+        self, room_id: str, approvals: list[Approval], header: Optional[str] = None
     ) -> list[Approval]:
-        """Send a header plus one Matrix message per approval with 👍/👎 reactions.
+        """Send an optional header plus one Matrix message per approval with 👍/👎 reactions.
 
         Each per-approval message is a distinct Matrix event whose event_id is
         mapped back to its approval identifier (persisted) so a later emoji
         reaction resolves to the right approval. The 👍/👎 reactions are
-        pre-seeded (best-effort) so users can tap one without a browser.
+        pre-seeded (best-effort) so users can tap one without a browser. When
+        ``header`` is None the caller has already sent the header.
 
         Returns the approvals whose message was sent successfully.
         """
-        await send_matrix_message(
-            self.homeserver, self.user_id, self.access_token, room_id, header,
-        )
+        if header:
+            await send_matrix_message(
+                self.homeserver, self.user_id, self.access_token, room_id, header,
+            )
 
         notified = []
         for approval in approvals:
@@ -2176,7 +2297,13 @@ class KeelMatrixBot:
         return notified
 
     async def handle_get_approvals(self, room_id: str):
-        """Handle the 'keel get approvals' command by fetching and displaying approvals."""
+        """Handle the 'keel get approvals' command by fetching and displaying approvals.
+
+        Approvals that are already fully approved or rejected are shown as a
+        separate "no action needed" summary instead of being presented again
+        as "Update Approval Required" requests, so deployments the user has
+        already confirmed do not look like they are asking for approval again.
+        """
         sending_msg = "🔄 Fetching approvals from Keel..."
         await send_matrix_message(
             self.homeserver, self.user_id, self.access_token,
@@ -2212,16 +2339,58 @@ class KeelMatrixBot:
             )
             return
 
-        # Send one message per approval (like new-approval notifications) so each
-        # individual record gets pre-seeded 👍/👎 reactions that resolve back to it.
-        header = "\n".join([
-            f"📋 **Pending Approvals ({len(approvals)})**",
-            f"**HTTP Status:** {response_status}",
-            "",
-            f"Each approval below is its own message — react {REACTION_APPROVE_EMOJI} "
-            f"to approve or {REACTION_REJECT_EMOJI} to reject it.",
-        ])
-        await self._send_approval_messages(room_id, approvals, header)
+        pending = [a for a in approvals if a.needs_action()]
+        resolved = [a for a in approvals if not a.needs_action()]
+
+        header_lines = []
+        if pending:
+            header_lines.append(f"📋 **Pending Approvals ({len(pending)})**")
+        else:
+            header_lines.append("✅ **No Pending Approvals**")
+        header_lines.append(f"**HTTP Status:** {response_status}")
+        if resolved:
+            resolved_list = ", ".join(f"`{a.identifier}`" for a in resolved)
+            header_lines.append(
+                f"✅ Already approved ({len(resolved)}): {resolved_list} — "
+                f"awaiting rollout, no action needed"
+            )
+        if pending:
+            header_lines.extend([
+                "",
+                f"Each pending approval below is its own message — react {REACTION_APPROVE_EMOJI} "
+                f"to approve or {REACTION_REJECT_EMOJI} to reject it.",
+            ])
+        header = "\n".join(header_lines)
+        await send_matrix_message(
+            self.homeserver, self.user_id, self.access_token, room_id, header,
+        )
+
+        # One message per pending approval (like new-approval notifications) so
+        # each individual record gets pre-seeded 👍/👎 reactions that resolve
+        # back to it.
+        if pending:
+            await self._send_approval_messages(room_id, pending, None)
+
+        if resolved:
+            lines = [
+                f"✅ **No action needed ({len(resolved)})**",
+                "",
+                "These approvals are already complete; Keel rolls approved updates out automatically:",
+                "",
+            ]
+            for approval in resolved:
+                if approval.rejected:
+                    lines.append(f"- `{approval.identifier}`: rejected")
+                else:
+                    lines.append(
+                        f"- `{approval.identifier}`: approved "
+                        f"({approval.votes_received}/{approval.votes_required} votes), awaiting rollout"
+                    )
+            lines.extend(["", SEPARATOR])
+            await send_matrix_message(
+                self.homeserver, self.user_id, self.access_token,
+                room_id, "\n".join(lines)
+            )
 
     async def handle_get_auto(self, room_id: str):
         """Handle the 'keel get auto' command by listing auto-approve image targets."""
@@ -2386,7 +2555,10 @@ class KeelMatrixBot:
 
         approval_memory.refresh_from_approvals(approvals)
         auto_approved_identifiers = await self.auto_approve_matching_approvals(self.room_id, approvals)
-        approvals_for_notify = [a for a in approvals if a.identifier not in auto_approved_identifiers]
+        approvals_for_notify = [
+            a for a in approvals
+            if a.needs_action() and a.identifier not in auto_approved_identifiers
+        ]
 
         new_approvals = get_new_approvals(approvals_for_notify)
         if not new_approvals:
@@ -2409,8 +2581,9 @@ class KeelMatrixBot:
             txn_id=f"{approval_notification_txn_id(new_approvals)}-header",
         )
 
+        # The header was sent above; pass None so it is not sent twice.
         notified_approvals = await self._send_approval_messages(
-            self.room_id, new_approvals, header
+            self.room_id, new_approvals, None
         )
         notified = len(notified_approvals)
         if notified_approvals:
@@ -2426,6 +2599,10 @@ class KeelMatrixBot:
 
         auto_approved_identifiers = set()
         for approval in approvals:
+            if not approval.needs_action():
+                # Already approved or rejected; nothing for auto-approve to do.
+                continue
+
             auto_dedup_key = f"auto-approve:{approval_dedup_key(approval)}"
             if auto_dedup_key in self.recently_processed_approvals:
                 print(f"[{datetime.now().isoformat()}] Auto-approve already submitted for {approval.identifier}; waiting for Keel to process it")
@@ -2628,6 +2805,48 @@ class KeelMatrixBot:
                 f"[{datetime.now().isoformat()}] Unable to capture approval metadata "
                 f"before {action}: {type(e).__name__}: {e}"
             )
+
+        # Already complete: do not submit a no-op vote. Clearly tell the user
+        # that no approval is needed instead of letting Keel keep this record
+        # looking like a request (it stays in the unarchived list until it is
+        # applied or its deadline passes).
+        if pre_action_approval is not None and not pre_action_approval.needs_action():
+            if pre_action_approval.rejected:
+                result_status = 200
+                response_msg = (
+                    f"ℹ️ **Already rejected**\n"
+                    f"\n"
+                    f"Identifier: `{identifier}`\n"
+                    f"Approval ID: `{pre_action_approval.id}`\n"
+                    f"\n"
+                    f"This approval was already rejected; no {get_action_noun(action)} was submitted.\n"
+                    f"\n"
+                    f"{SEPARATOR}"
+                )
+            else:
+                result_status = 200
+                response_msg = (
+                    f"✅ **Already approved — no action needed**\n"
+                    f"\n"
+                    f"Identifier: `{identifier}`\n"
+                    f"Approval ID: `{pre_action_approval.id}`\n"
+                    f"Update: `{pre_action_approval.current_version}` → `{pre_action_approval.new_version}`\n"
+                    f"Votes: {pre_action_approval.votes_received}/{pre_action_approval.votes_required}\n"
+                )
+                voter_line = format_voter_line(pre_action_approval)
+                if voter_line:
+                    response_msg += f"{voter_line}\n"
+                response_msg += (
+                    f"\n"
+                    f"Keel will roll this out automatically; the approval stays listed until it is applied or expires.\n"
+                    f"\n"
+                    f"{SEPARATOR}"
+                )
+            await send_matrix_message(
+                self.homeserver, self.user_id, self.access_token,
+                room_id, response_msg
+            )
+            return result_status, response_msg
 
         async with httpx.AsyncClient(timeout=30) as client:
             try:
