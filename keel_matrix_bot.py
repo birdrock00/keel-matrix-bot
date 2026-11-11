@@ -623,19 +623,22 @@ def format_approvals_list(
     approval_timestamps: dict = None,
     approve_base_url: str = DEFAULT_APPROVE_BASE_URL
 ) -> str:
-    """Format a list of approvals for display.
+    """Format a list of pending approvals for display.
+
+    Approvals that are already fully approved or rejected are omitted: Keel
+    rolls them out (or declines to) automatically, so they do not belong in
+    the user's list of things to act on.
 
     Args:
         approvals: List of Approval objects to format
         approval_timestamps: Optional dict mapping approval identifier to first_seen timestamp
     """
+    approvals = [a for a in approvals if a.needs_action()]
+
     if not approvals:
         return "✅ No pending approvals at this time."
 
-    if all(approval.needs_action() for approval in approvals):
-        title = f"📋 **Pending Approvals ({len(approvals)})**"
-    else:
-        title = f"📋 **Approvals ({len(approvals)})**"
+    title = f"📋 **Pending Approvals ({len(approvals)})**"
 
     lines = [
         title,
@@ -675,13 +678,10 @@ def format_approvals_list(
         if effective_image:
             lines.append(f"   Image: `{effective_image}`")
 
-        if approval.needs_action():
-            approve_url = get_approve_action_url(approval.identifier, approve_base_url)
-            deny_url = get_deny_action_url(approval.identifier, approve_base_url)
-            image_name = get_image_name_from_identifier(approval.identifier)
-            lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})")
-        else:
-            lines.append("   No action needed — this approval is already complete.")
+        approve_url = get_approve_action_url(approval.identifier, approve_base_url)
+        deny_url = get_deny_action_url(approval.identifier, approve_base_url)
+        image_name = get_image_name_from_identifier(approval.identifier)
+        lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})")
 
         if days_pending:
             lines.append(f"   {days_pending}")
@@ -2299,10 +2299,10 @@ class KeelMatrixBot:
     async def handle_get_approvals(self, room_id: str):
         """Handle the 'keel get approvals' command by fetching and displaying approvals.
 
-        Approvals that are already fully approved or rejected are shown as a
-        separate "no action needed" summary instead of being presented again
-        as "Update Approval Required" requests, so deployments the user has
-        already confirmed do not look like they are asking for approval again.
+        Approvals that are already fully approved or rejected are hidden
+        entirely: Keel rolls approved updates out automatically (and will not
+        roll out rejected ones), so they should not appear in the user's
+        list of pending approvals.
         """
         sending_msg = "🔄 Fetching approvals from Keel..."
         await send_matrix_message(
@@ -2332,34 +2332,22 @@ class KeelMatrixBot:
             )
             return
 
-        if not approvals:
+        pending = [a for a in approvals if a.needs_action()]
+
+        if not pending:
             await send_matrix_message(
                 self.homeserver, self.user_id, self.access_token,
                 room_id, "✅ No pending approvals at this time."
             )
             return
 
-        pending = [a for a in approvals if a.needs_action()]
-        resolved = [a for a in approvals if not a.needs_action()]
-
-        header_lines = []
-        if pending:
-            header_lines.append(f"📋 **Pending Approvals ({len(pending)})**")
-        else:
-            header_lines.append("✅ **No Pending Approvals**")
-        header_lines.append(f"**HTTP Status:** {response_status}")
-        if resolved:
-            resolved_list = ", ".join(f"`{a.identifier}`" for a in resolved)
-            header_lines.append(
-                f"✅ Already approved ({len(resolved)}): {resolved_list} — "
-                f"awaiting rollout, no action needed"
-            )
-        if pending:
-            header_lines.extend([
-                "",
-                f"Each pending approval below is its own message — react {REACTION_APPROVE_EMOJI} "
-                f"to approve or {REACTION_REJECT_EMOJI} to reject it.",
-            ])
+        header_lines = [
+            f"📋 **Pending Approvals ({len(pending)})**",
+            f"**HTTP Status:** {response_status}",
+            "",
+            f"Each pending approval below is its own message — react {REACTION_APPROVE_EMOJI} "
+            f"to approve or {REACTION_REJECT_EMOJI} to reject it.",
+        ]
         header = "\n".join(header_lines)
         await send_matrix_message(
             self.homeserver, self.user_id, self.access_token, room_id, header,
@@ -2368,29 +2356,7 @@ class KeelMatrixBot:
         # One message per pending approval (like new-approval notifications) so
         # each individual record gets pre-seeded 👍/👎 reactions that resolve
         # back to it.
-        if pending:
-            await self._send_approval_messages(room_id, pending, None)
-
-        if resolved:
-            lines = [
-                f"✅ **No action needed ({len(resolved)})**",
-                "",
-                "These approvals are already complete; Keel rolls approved updates out automatically:",
-                "",
-            ]
-            for approval in resolved:
-                if approval.rejected:
-                    lines.append(f"- `{approval.identifier}`: rejected")
-                else:
-                    lines.append(
-                        f"- `{approval.identifier}`: approved "
-                        f"({approval.votes_received}/{approval.votes_required} votes), awaiting rollout"
-                    )
-            lines.extend(["", SEPARATOR])
-            await send_matrix_message(
-                self.homeserver, self.user_id, self.access_token,
-                room_id, "\n".join(lines)
-            )
+        await self._send_approval_messages(room_id, pending, None)
 
     async def handle_get_auto(self, room_id: str):
         """Handle the 'keel get auto' command by listing auto-approve image targets."""

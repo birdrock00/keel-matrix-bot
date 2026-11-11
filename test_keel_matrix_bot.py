@@ -541,18 +541,17 @@ class ResolvedApprovalMessageTests(unittest.TestCase):
         self.assertNotIn("[Approve app]", message)
         self.assertNotIn("[Deny approval app]", message)
 
-    def test_approvals_list_only_offers_links_for_pending(self):
+    def test_approvals_list_hides_resolved_approvals(self):
         pending = sample_approval("ns/app:1")
         done = sample_approval("ns/done:1")
         done.votes_received = 1
 
         message = format_approvals_list([pending, done], approve_base_url="https://bot.example")
 
-        self.assertIn("📋 **Approvals (2)**", message)
+        self.assertIn("📋 **Pending Approvals (1)**", message)
         self.assertIn("[Approve app](https://bot.example/approve?identifier=ns%2Fapp%3A1)", message)
-        self.assertIn("Status: Approved (1/1 votes)", message)
-        self.assertIn("No action needed — this approval is already complete.", message)
-        self.assertNotIn("identifier=ns%2Fdone%3A1", message)
+        self.assertNotIn("ns/done", message)
+        self.assertNotIn("No action needed", message)
 
     def test_approvals_list_keeps_pending_title_when_all_need_action(self):
         message = format_approvals_list([sample_approval()], approve_base_url="https://bot.example")
@@ -656,7 +655,7 @@ class GetApprovalsResolutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(keel_matrix_bot, "send_matrix_reaction", new=fake_reaction),
         )
 
-    async def test_pending_and_resolved_approvals_are_shown_separately(self):
+    async def test_resolved_approvals_are_hidden_from_list(self):
         bot = make_bot()
         pending = sample_approval("ns/app:1")
         done = sample_approval("ns/done:1")
@@ -673,8 +672,10 @@ class GetApprovalsResolutionTests(unittest.IsolatedAsyncioTestCase):
 
         joined = "\n".join(sent)
         self.assertIn("📋 **Pending Approvals (1)**", joined)
-        self.assertIn("Already approved (1): `ns/done:1`", joined)
-        self.assertIn("No action needed (1)", joined)
+        # Already-approved / rejected matches must not be shown at all.
+        self.assertNotIn("Already approved", joined)
+        self.assertNotIn("No action needed", joined)
+        self.assertNotIn("ns/done:1", joined)
         # One actionable message for the pending approval only.
         self.assertTrue(any("Update Approval Required" in m and "ns/app:1" in m for m in sent))
         self.assertFalse(any("Update Approval Required" in m and "ns/done:1" in m for m in sent))
@@ -696,8 +697,9 @@ class GetApprovalsResolutionTests(unittest.IsolatedAsyncioTestCase):
             await bot.handle_get_approvals("!room:example")
 
         joined = "\n".join(sent)
-        self.assertIn("No Pending Approvals", joined)
-        self.assertIn("No action needed (1)", joined)
+        self.assertIn("No pending approvals", joined)
+        self.assertNotIn("Already approved", joined)
+        self.assertNotIn("No action needed", joined)
         self.assertFalse(any("Update Approval Required" in m for m in sent))
 
 
