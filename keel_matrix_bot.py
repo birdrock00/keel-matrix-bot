@@ -321,7 +321,10 @@ def format_approval_message(
 
     approve_url = get_approval_action_url(approval.identifier, "approve", approve_base_url)
     deny_url = get_approval_action_url(approval.identifier, "deny", approve_base_url)
-    image_name = get_image_name_from_identifier(approval.identifier)
+    # For multi-container workloads Keel's identifier names the workload (the
+    # main container), so label sidecar updates with resource/image
+    # (e.g. 'firefox/wireguard') to keep containers apart.
+    image_name = get_release_notes_key(approval) or get_image_name_from_identifier(approval.identifier)
 
     lines = [
         "📦 **Update Approval Required**",
@@ -561,6 +564,51 @@ def normalize_release_notes_key(key: str) -> str:
     return str(key or "").strip().lower()
 
 
+def release_notes_key_segments(key: str) -> set:
+    """Return the lowercased name segments of a release-notes key.
+
+    Path parts are split on ``/`` and any ``:tag`` suffix is removed, so
+    ``deployment/vaultwarden/vaultwarden:latest`` yields
+    ``{"deployment", "vaultwarden"}`` and ``vaultwarden-mcp/warden-mcp``
+    yields ``{"vaultwarden-mcp", "warden-mcp"}``.
+    """
+    segments = set()
+    for part in str(key or "").strip().lower().split("/"):
+        part = part.strip()
+        if not part:
+            continue
+        segments.add(part)
+        base = part.split(":", 1)[0].strip()
+        if base:
+            segments.add(base)
+    return segments
+
+
+def approval_release_notes_names(target) -> set:
+    """Return the names a release-notes/auto-approve key may match for a target.
+
+    For an Approval this is the workload/resource name plus the changed
+    image name; for a raw identifier string it is just the resource name.
+    The namespace and the full identifier are deliberately excluded, so a
+    key configured for one container of an app (``vaultwarden``) can never
+    leak onto a sibling container (``vaultwarden-mcp``) that merely shares
+    the namespace or the main container's identifier.
+    """
+    names = set()
+    if isinstance(target, Approval):
+        resource = get_resource_name_from_identifier(target.identifier)
+        if resource:
+            names.add(resource.lower())
+        image = get_repository_image_name(target)
+        if image:
+            names.add(image.lower())
+    else:
+        resource = get_resource_name_from_identifier(str(target))
+        if resource:
+            names.add(resource.lower())
+    return names
+
+
 DEFAULT_RELEASE_NOTES_URLS = {
     "actualbudget/actual-server": "https://www.actualbudget.com/docs/releases/",
     "codewithcj/sparkyfitness": "https://github.com/CodeWithCJ/SparkyFitness/releases",
@@ -680,7 +728,9 @@ def format_approvals_list(
 
         approve_url = get_approve_action_url(approval.identifier, approve_base_url)
         deny_url = get_deny_action_url(approval.identifier, approve_base_url)
-        image_name = get_image_name_from_identifier(approval.identifier)
+        # resource/image label keeps sidecar containers (e.g. the wireguard
+        # sidecar inside firefox) distinct from the main container.
+        image_name = get_release_notes_key(approval) or get_image_name_from_identifier(approval.identifier)
         lines.append(f"   [Approve {image_name}]({approve_url}) | [Deny approval {image_name}]({deny_url})")
 
         if days_pending:
@@ -1330,14 +1380,26 @@ class ApprovalMemory:
         with self._lock:
             return dict(self.release_notes_urls)
 
-    def get_matching_auto_targets(self, identifier: str) -> list[str]:
-        """Return auto-approve targets matching this approval identifier."""
+    def get_matching_auto_targets(self, identifier: str, approval: Optional[Approval] = None) -> list[str]:
+        """Return auto-approve targets matching this approval.
+
+        A target matches when it equals the full identifier, the approval's
+        workload name, or its changed image name. Matching is exact on those
+        names (never a raw substring), so a target for one container of an
+        app does not auto-approve a sibling container of the same app.
+        """
         self._ensure_loaded()
-        identifier_lower = identifier.lower()
+        match_keys = {str(identifier or "").strip().lower()}
+        resource = get_resource_name_from_identifier(identifier)
+        if resource:
+            match_keys.add(resource.lower())
+        if approval is not None:
+            match_keys |= approval_release_notes_names(approval)
+        match_keys.discard("")
         with self._lock:
             return sorted(
                 target for target in self.auto_approve_targets
-                if target.lower() in identifier_lower or identifier_lower in target.lower()
+                if normalize_release_notes_key(target) in match_keys
             )
 
     def set_release_notes_url(self, identifier: str, url: str) -> str:
@@ -1421,13 +1483,14 @@ def mark_auto_approve_failed(approval: Approval, reason: str):
     """Remember a failed auto-approve attempt for this approval ID."""
     approval_memory.mark_auto_approve_failed(approval, reason)
 
-def set_release_notes_url(identifier: str, url: str):
-    """Set the release notes URL for an approval identifier."""
+def set_release_notes_url(identifier: str, url: str) -> str:
+    """Set the release notes URL for an approval identifier; return the stored key."""
     stored_identifier = approval_memory.set_release_notes_url(identifier, url)
     print(
         f"[{datetime.now().isoformat()}] Set release notes URL for "
         f"'{stored_identifier or identifier}': {url.strip()}"
     )
+    return stored_identifier or identifier
 
 def set_auto_approve_target(target: str):
     """Add an auto-approve target keyword/identifier."""
@@ -1441,18 +1504,23 @@ def get_approval_timestamps() -> dict:
     """Return approval first-seen timestamps."""
     return approval_memory.get_approval_timestamps()
 
-def get_matching_auto_targets(identifier: str) -> list[str]:
-    """Return configured auto-approve targets matching an identifier."""
-    return approval_memory.get_matching_auto_targets(identifier)
+def get_matching_auto_targets(identifier: str, approval: Optional[Approval] = None) -> list[str]:
+    """Return configured auto-approve targets matching an approval."""
+    return approval_memory.get_matching_auto_targets(identifier, approval)
 
 def get_release_notes_url(target) -> str:
     """Get the release notes URL for an approval or identifier. Returns 'N/A' if not set.
 
-    Handles partial matching - if exact identifier not found, looks for keys
-    that are contained within the identifier or vice versa. This allows storing
-    'llama-cpp-amd' and matching 'deployment/llama-cpp-amd/llama-cpp-amd:latest'.
-    When an Approval includes event.repository data, it also checks keys like
-    'firefox/wireguard' for multi-image deployments.
+    Exact keys win first (full identifier, 'resource/image' release-notes key,
+    workload name, image name, repository). Partial matching is segment-based
+    and container-aware: a stored key only matches when one of its path
+    segments equals the approval's workload name or its changed image name -
+    never a raw substring of the full identifier. This allows storing
+    'llama-cpp-amd' and matching 'deployment/llama-cpp-amd/llama-cpp-amd:latest',
+    while a key set for one container of an app ('vaultwarden') can never leak
+    onto a sibling container ('vaultwarden-mcp') that merely shares the
+    namespace. Multi-container deployments can use 'resource/image' keys like
+    'firefox/wireguard'.
     """
     lookup_keys = get_release_notes_lookup_keys(target)
     release_notes_urls = approval_memory.get_release_notes_urls(require_loaded=False)
@@ -1468,20 +1536,28 @@ def get_release_notes_url(target) -> str:
         if normalized_key in configured_urls:
             return configured_urls[normalized_key]
 
-    # Try partial matching, preferring the most specific overlap. This prevents
-    # an older broad or differently-cased key from winning just because it was
-    # inserted earlier in persisted state.
+    # Segment-based partial matching, preferring the longest matching name.
+    # A stored key only matches when one of its segments equals the
+    # approval's workload name or changed image name - never a raw
+    # substring of the full identifier. So a key set for one container of an
+    # app ('vaultwarden') can never leak onto a sibling container
+    # ('vaultwarden-mcp') whose identifier merely shares the namespace, and
+    # an older broad or differently-cased key cannot win on coincidence.
+    name_keys = approval_release_notes_names(target)
     best_match = None
-    lookup_keys_lower = [normalize_release_notes_key(key) for key in lookup_keys]
     for key, url in release_notes_urls.items():
-        key_lower = normalize_release_notes_key(key)
-        for lookup_key in lookup_keys_lower:
-            if not key_lower or not lookup_key:
-                continue
-            if key_lower in lookup_key or lookup_key in key_lower:
-                score = min(len(key_lower), len(lookup_key))
-                if best_match is None or score > best_match[0]:
-                    best_match = (score, url)
+        stored_segments = release_notes_key_segments(key)
+        if not stored_segments:
+            continue
+        matched = max(
+            (name for name in name_keys if name in stored_segments),
+            key=len,
+            default=None,
+        )
+        if matched is None:
+            continue
+        if best_match is None or len(matched) > best_match[0]:
+            best_match = (len(matched), url)
 
     if best_match is not None:
         return best_match[1]
@@ -2404,15 +2480,18 @@ class KeelMatrixBot:
     async def handle_set_url(self, room_id: str, identifier: str, url: str):
         """Handle the 'keel set-url <identifier> <url>' command to set a release notes URL."""
         # Store the URL in memory
-        set_release_notes_url(identifier, url)
+        stored_key = set_release_notes_url(identifier, url)
 
         response_msg = (
             f"✅ **Release notes URL set!**\n"
             f"\n"
             f"Identifier: `{identifier}`\n"
+            f"Stored under: `{stored_key}`\n"
             f"Release Notes URL: {url}\n"
             f"\n"
-            f"Future approval notifications for this identifier will include this URL.\n"
+            f"Future approval notifications matching this identifier will include this URL.\n"
+            f"For multi-container workloads, key sidecars by container/image name, "
+            f"e.g. `keel set-url vaultwarden-mcp <url>` or `keel set-url firefox/wireguard <url>`.\n"
             f"\n"
             f"{SEPARATOR}"
         )
@@ -2492,7 +2571,7 @@ class KeelMatrixBot:
             f"\n"
             f"New target: `{target}`\n"
             f"\n"
-            f"Any pending approval whose identifier matches this target will be auto-approved when seen.\n"
+            f"Any pending approval whose identifier, workload name, or image matches this target will be auto-approved when seen.\n"
             f"Immediate auto-approved now: **{len(auto_approved_identifiers)}**\n"
             f"\n"
             f"**Configured auto-approve targets ({len(targets)}):**\n"
@@ -2575,7 +2654,7 @@ class KeelMatrixBot:
                 auto_approved_identifiers.add(approval.identifier)
                 continue
 
-            matches = get_matching_auto_targets(approval.identifier)
+            matches = get_matching_auto_targets(approval.identifier, approval)
             if not matches:
                 continue
 

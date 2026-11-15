@@ -703,5 +703,142 @@ class GetApprovalsResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("Update Approval Required" in m for m in sent))
 
 
+class ContainerScopedReleaseNotesTests(unittest.TestCase):
+    """set-url keys must stay scoped to their own container.
+
+    A key stored for the main container of an app ('vaultwarden') must not
+    leak onto sibling containers ('vaultwarden-mcp') that merely share the
+    namespace, and container-specific keys (workload name, image name, or
+    resource/image) must match their own approvals.
+    """
+
+    VAULTWARDEN_URL = "https://github.com/dani-garcia/vaultwarden/releases/"
+    WARDEN_MCP_URL = "https://github.com/icoretech/warden-mcp/releases"
+
+    @staticmethod
+    def _approval(identifier, repository_name, new_version="latest"):
+        return Approval(
+            id="approval-1",
+            provider="kubernetes",
+            identifier=identifier,
+            message="New image available",
+            current_version="old",
+            new_version=new_version,
+            created_at="2026-11-15T00:00:00Z",
+            repository_name=repository_name,
+            repository_tag=new_version,
+        )
+
+    @staticmethod
+    def _lookup(urls, target):
+        memory = loaded_memory()
+        memory.release_notes_urls = dict(urls)
+        with patch.object(keel_matrix_bot, "approval_memory", memory):
+            return keel_matrix_bot.get_release_notes_url(target)
+
+    def test_main_container_key_matches_main_approval(self):
+        main = self._approval(
+            "deployment/vaultwarden/vaultwarden:latest",
+            "index.docker.io/vaultwarden/server",
+        )
+        self.assertEqual(
+            self._lookup({"vaultwarden": self.VAULTWARDEN_URL}, main),
+            self.VAULTWARDEN_URL,
+        )
+
+    def test_main_container_key_does_not_leak_to_sibling_container(self):
+        mcp = self._approval(
+            "deployment/vaultwarden/vaultwarden-mcp:0.2.74",
+            "ghcr.io/icoretech/warden-mcp",
+            "0.2.74",
+        )
+        # Only the main-container key is configured: the sibling approval
+        # must NOT pick it up from the shared namespace segment.
+        resolved = self._lookup({"vaultwarden": self.VAULTWARDEN_URL}, mcp)
+        self.assertNotEqual(resolved, self.VAULTWARDEN_URL)
+
+    def test_sibling_container_key_matches_sibling_approval(self):
+        mcp = self._approval(
+            "deployment/vaultwarden/vaultwarden-mcp:0.2.74",
+            "ghcr.io/icoretech/warden-mcp",
+            "0.2.74",
+        )
+        self.assertEqual(
+            self._lookup({"vaultwarden-mcp": self.WARDEN_MCP_URL}, mcp),
+            self.WARDEN_MCP_URL,
+        )
+
+    def test_image_name_key_matches_sibling_approval(self):
+        mcp = self._approval(
+            "deployment/vaultwarden/vaultwarden-mcp:0.2.74",
+            "ghcr.io/icoretech/warden-mcp",
+            "0.2.74",
+        )
+        self.assertEqual(
+            self._lookup({"warden-mcp": self.WARDEN_MCP_URL}, mcp),
+            self.WARDEN_MCP_URL,
+        )
+
+    def test_sibling_key_does_not_leak_back_to_main_container(self):
+        main = self._approval(
+            "deployment/vaultwarden/vaultwarden:latest",
+            "index.docker.io/vaultwarden/server",
+        )
+        resolved = self._lookup({"vaultwarden-mcp": self.WARDEN_MCP_URL}, main)
+        self.assertNotEqual(resolved, self.WARDEN_MCP_URL)
+
+    def test_sidecar_resource_image_key_matches(self):
+        sidecar = self._approval(
+            "deployment/firefox/firefox:latest",
+            "lscr.io/linuxserver/wireguard",
+        )
+        url = "https://github.com/linuxserver/docker-wireguard/releases"
+        self.assertEqual(self._lookup({"firefox/wireguard": url}, sidecar), url)
+
+    def test_approval_label_names_sidecar_container(self):
+        sidecar = self._approval(
+            "deployment/firefox/firefox:latest",
+            "lscr.io/linuxserver/wireguard",
+        )
+        message = keel_matrix_bot.format_approval_message(sidecar)
+        self.assertIn("[Approve firefox/wireguard]", message)
+
+    def test_auto_target_does_not_leak_to_sibling_container(self):
+        memory = loaded_memory()
+        memory.auto_approve_targets = {"vaultwarden"}
+        with patch.object(keel_matrix_bot, "approval_memory", memory):
+            mcp = self._approval(
+                "deployment/vaultwarden/vaultwarden-mcp:0.2.74",
+                "ghcr.io/icoretech/warden-mcp",
+                "0.2.74",
+            )
+            self.assertEqual(
+                keel_matrix_bot.get_matching_auto_targets(mcp.identifier, mcp),
+                [],
+            )
+            main = self._approval(
+                "deployment/vaultwarden/vaultwarden:latest",
+                "index.docker.io/vaultwarden/server",
+            )
+            self.assertEqual(
+                keel_matrix_bot.get_matching_auto_targets(main.identifier, main),
+                ["vaultwarden"],
+            )
+
+    def test_auto_target_matches_sibling_container_name(self):
+        memory = loaded_memory()
+        memory.auto_approve_targets = {"vaultwarden-mcp"}
+        with patch.object(keel_matrix_bot, "approval_memory", memory):
+            mcp = self._approval(
+                "deployment/vaultwarden/vaultwarden-mcp:0.2.74",
+                "ghcr.io/icoretech/warden-mcp",
+                "0.2.74",
+            )
+            self.assertEqual(
+                keel_matrix_bot.get_matching_auto_targets(mcp.identifier, mcp),
+                ["vaultwarden-mcp"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
